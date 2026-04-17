@@ -486,13 +486,17 @@ TIPS = {
     'BOS':             'Break of Structure with clean HH+HL or LH+LL pattern. Trend continuation confirmed by volume and momentum.',
 }
 
+def esc(s):
+    """Escape HTML special chars in dynamic content"""
+    return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+
 def build_signal_msg(sig, pair):
     is_buy = sig['dir'] == 'BUY'
     emojis = {'SWEEP_OB':'⚡','HTF_CONFLUENCE':'📊','CHOCH':'🔄','BOS':'📈'}
     e = emojis.get(sig['setup'], '📡')
     lines = [
         f"{'🟢' if is_buy else '🔴'} <b>{'STRONG ' if sig['score']>=9 else ''}{sig['dir']} — {pair['sym']}/USD</b>",
-        f"{e} <b>Setup: {sig['name']}</b>",
+        f"{e} <b>Setup: {esc(sig['name'])}</b>",
         '',
         f"📌 <i>{TIPS.get(sig['setup'], 'SMC confluence setup.')}</i>",
         '',
@@ -504,8 +508,8 @@ def build_signal_msg(sig, pair):
         f"  TP3:    <code>{fp(sig['tp3'])}</code>  <i>(1:3 — let runner go)</i>",
         '',
         f"📊 <b>Score: {sig['score']}/10  |  Confidence: {sig['conf']}%  |  R:R 1:{sig['rr']}</b>",
-        f"  Confluences: {' · '.join(sig['tags'])}",
-        f"  Weekly: {sig['weekly']}  |  Daily: {sig['daily']}  |  RSI: {sig['rsi_val']}",
+        f"  Confluences: {esc(' · '.join(sig['tags']))}",
+        f"  Weekly: {esc(sig['weekly'])}  |  Daily: {esc(sig['daily'])}  |  RSI: {sig['rsi_val']}",
     ]
     if sig.get('ob'):
         lines.append(f"  OB Zone: {fp(sig['ob']['bot'])} – {fp(sig['ob']['top'])}")
@@ -540,16 +544,29 @@ def build_result_msg(sym, result, pnl, trade):
 # ── TELEGRAM ───────────────────────────────────
 def send_tg(msg):
     if not TG_TOKEN or not TG_CHAT: return False
-    try:
-        r = requests.post(
-            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-            json={'chat_id':TG_CHAT, 'text':msg,
-                  'parse_mode':'HTML', 'disable_web_page_preview':True},
-            timeout=10)
-        return r.ok
-    except Exception as e:
-        log.error(f"TG error: {e}")
-        return False
+    # Try HTML first, fall back to plain text if it fails
+    for parse_mode in ['HTML', None]:
+        try:
+            payload = {
+                'chat_id': TG_CHAT,
+                'text': msg,
+                'disable_web_page_preview': True
+            }
+            if parse_mode:
+                payload['parse_mode'] = parse_mode
+            r = requests.post(
+                f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+                json=payload,
+                timeout=10
+            )
+            if r.ok:
+                return True
+            else:
+                err = r.json().get('description','unknown')
+                log.warning(f"TG {parse_mode} failed: {err} — retrying plain")
+        except Exception as e:
+            log.error(f"TG error: {e}")
+    return False
 
 # ── PRICE CHECK (for BE manager) ───────────────
 def check_prices():
