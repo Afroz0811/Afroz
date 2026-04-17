@@ -543,30 +543,48 @@ def build_result_msg(sym, result, pnl, trade):
 
 # ── TELEGRAM ───────────────────────────────────
 def send_tg(msg):
-    if not TG_TOKEN or not TG_CHAT: return False
-    # Try HTML first, fall back to plain text if it fails
-    for parse_mode in ['HTML', None]:
-        try:
-            payload = {
+    if not TG_TOKEN or not TG_CHAT:
+        log.error("TG_TOKEN or TG_CHAT not set!")
+        return False
+    try:
+        r = requests.post(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            json={
                 'chat_id': TG_CHAT,
                 'text': msg,
+                'parse_mode': 'HTML',
                 'disable_web_page_preview': True
-            }
-            if parse_mode:
-                payload['parse_mode'] = parse_mode
-            r = requests.post(
+            },
+            timeout=10
+        )
+        if r.ok:
+            return True
+        # Log the full error details
+        try:
+            err_body = r.json()
+            err_desc = err_body.get('description', 'unknown')
+            err_code = err_body.get('error_code', r.status_code)
+        except:
+            err_desc = r.text[:200]
+            err_code = r.status_code
+        log.error(f"TG failed [{err_code}]: {err_desc}")
+        log.error(f"  Full token length: {len(TG_TOKEN)} chars")
+        log.error(f"  Token: {TG_TOKEN[:15]}...{TG_TOKEN[-6:]}")
+        log.error(f"  Chat ID: {TG_CHAT}")
+        # Retry without HTML if parse error
+        if 'parse' in err_desc.lower() or 'html' in err_desc.lower():
+            r2 = requests.post(
                 f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
-                json=payload,
+                json={'chat_id': TG_CHAT, 'text': msg[:4000], 'disable_web_page_preview': True},
                 timeout=10
             )
-            if r.ok:
+            if r2.ok:
+                log.info("TG sent (plain text fallback)")
                 return True
-            else:
-                err = r.json().get('description','unknown')
-                log.warning(f"TG {parse_mode} failed: {err} — retrying plain")
-        except Exception as e:
-            log.error(f"TG error: {e}")
-    return False
+        return False
+    except Exception as e:
+        log.error(f"TG exception: {e}")
+        return False
 
 # ── PRICE CHECK (for BE manager) ───────────────
 def check_prices():
@@ -647,6 +665,12 @@ def main():
 
     log.info("="*55)
     log.info("SMC ENGINE PRO v3 — 24/7 ALERT SERVER")
+    # Print token info for debugging (first/last 6 chars only)
+    if TG_TOKEN:
+        log.info(f"TG_TOKEN: {TG_TOKEN[:15]}...{TG_TOKEN[-6:]} (len={len(TG_TOKEN)})")
+    else:
+        log.info("TG_TOKEN: NOT SET")
+    log.info(f"TG_CHAT:  {TG_CHAT}")
     log.info(f"Pairs: {len(PAIRS)} | Score≥{MIN_SCORE} (off-session: {MIN_SCORE+1}) | Every {SCAN_EVERY}m")
     log.info(f"Interval: {SCAN_EVERY}m | Cooldown: {COOLDOWN_M}m")
     log.info(f"Sessions: London 07-12 UTC | NY 13-18 UTC")
