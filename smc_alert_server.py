@@ -110,7 +110,7 @@ def fetch_candles(pair, limit=300):
                 if len(raw) > 20:
                     return [{'t':i,'o':float(k[1]),'h':float(k[2]),
                              'l':float(k[3]),'c':float(k[4]),'v':float(k[6]),
-                             'hour': datetime.utcfromtimestamp(int(k[0])).hour}
+                             'hour': datetime.fromtimestamp(int(k[0]), tz=timezone.utc).hour}
                             for i, k in enumerate(raw[-limit:])]
     except Exception as e:
         log.debug(f"Kraken {pair['sym']}: {e}")
@@ -121,7 +121,7 @@ def fetch_candles(pair, limit=300):
         if isinstance(raw, list) and len(raw) > 5:
             return [{'t':i,'o':float(k[1]),'h':float(k[2]),
                      'l':float(k[3]),'c':float(k[4]),'v':50.0,
-                     'hour': datetime.utcfromtimestamp(int(k[0])/1000).hour}
+                     'hour': datetime.fromtimestamp(int(k[0])/1000, tz=timezone.utc).hour}
                     for i, k in enumerate(raw[-limit:])]
     except Exception as e:
         log.debug(f"CoinGecko {pair['sym']}: {e}")
@@ -519,7 +519,7 @@ def build_signal_msg(sig, pair):
         '  • Let remaining run to TP2, then TP3',
         '',
         '⚠️ <i>Not financial advice. Always manage risk.</i>',
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  Session: {session_label}",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
         f"📡 <b>SMC Engine Pro v3</b>",
     ]
     return '\n'.join(l for l in lines if l is not None)
