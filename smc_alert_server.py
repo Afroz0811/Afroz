@@ -24,6 +24,465 @@ import requests
 import numpy as np
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
+import math
+
+# ════════════════════════════════════════════════
+# SELF-LEARNING ENGINE (inline)
+# ════════════════════════════════════════════════
+"""
+SMC Self-Learning Engine
+========================
+Stores every signal, monitors outcomes, learns from results.
+Automatically adjusts which confluence factors matter most
+based on REAL trade performance — not synthetic backtests.
+
+Storage: JSON file (works on Railway with persistent volume)
+         or SQLite for more advanced queries
+
+Learning:
+- Tracks win/loss per: setup, RSI range, session, weekly bias, score, tags
+- After 20+ trades: auto-adjusts weights
+- Sends weekly "what I learned" report to Telegram
+"""
+
+
+LEARN_FILE = os.environ.get('LEARN_FILE', '/app/smc_learning.json')
+
+# ── DEFAULT WEIGHTS (start here, engine adjusts over time) ──────────
+DEFAULT_WEIGHTS = {
+    # Setup base scores
+    'setup_scores': {
+        'SWEEP_OB':        8.0,
+        'HTF_CONFLUENCE':  8.0,
+        'CHOCH':           8.0,
+        'BOS':             7.0,
+    },
+    # Tag multipliers (how much each confluence adds)
+    'tag_weights': {
+        'Sweep↑':      1.0, 'Sweep↓':      1.0,
+        'OB_Retest':   1.0, 'Vol✓':        0.8,
+        'HTF✓':        0.8, 'Week✓':       0.6,
+        'EMA↑':        0.5, 'EMA↓':        0.5,
+        'MACD✓':       0.5, 'CHoCH↑':      1.0,
+        'CHoCH↓':      1.0, 'BOS↑':        0.8,
+        'BOS↓':        0.8, 'HH+HL':       0.6,
+        'CleanStr':    0.5, 'RSI_Div✓':    1.5,
+        'Fib✓':        0.5, 'VWAP✓':       0.3,
+    },
+    # Session multipliers
+    'session_weights': {
+        'London':    1.2,
+        'New York':  1.2,
+        'Asian':     0.8,
+        'Weekend':   0.5,
+    },
+    # RSI zone effectiveness
+    'rsi_zones': {
+        '20-30': 1.3,  # deep oversold = strong buy
+        '30-40': 1.1,
+        '40-50': 1.0,
+        '50-60': 0.9,
+        '60-70': 1.1,
+        '70-80': 1.3,  # deep overbought = strong sell
+    },
+    # Weekly bias multiplier
+    'weekly_bias_mult': {
+        'bullish': 1.2,
+        'neutral': 0.9,
+        'bearish': 0.7,  # against weekly = risky
+    },
+    # Minimum score to fire (adjusted based on session)
+    'min_score_session': {
+        'London':    6.0,
+        'New York':  6.0,
+        'Asian':     7.0,
+        'Weekend':   8.0,
+    }
+}
+
+# ── DATA SCHEMA ──────────────────────────────────────────────────────
+def load_db():
+    if Path(LEARN_FILE).exists():
+        try:
+            with open(LEARN_FILE) as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        'version': 2,
+        'created': datetime.now(timezone.utc).isoformat(),
+        'weights': DEFAULT_WEIGHTS.copy(),
+        'signals': [],        # every signal fired
+        'outcomes': [],       # completed trades with result
+        'stats': {
+            'total_signals': 0,
+            'total_trades':  0,
+            'wins': 0, 'losses': 0, 'be': 0,
+            'total_pnl': 0.0,
+            'by_setup': {},
+            'by_session': {},
+            'by_rsi_zone': {},
+            'by_tag': {},
+            'by_weekly': {},
+            'by_score_range': {},
+        },
+        'learning_log': [],   # what changed and why
+        'last_learned': None,
+    }
+
+def save_db(db):
+    try:
+        with open(LEARN_FILE, 'w') as f:
+            json.dump(db, f, indent=2)
+    except Exception as e:
+        print(f"DB save error: {e}")
+
+# ── LOG A NEW SIGNAL ─────────────────────────────────────────────────
+def log_signal(sig, pair, session):
+    db = load_db()
+    rsi_zone = get_rsi_zone(sig.get('rsi_val', 50))
+    entry = {
+        'id':           f"{pair['sym']}_{int(time.time())}",
+        'sym':          pair['sym'],
+        'setup':        sig['setup'],
+        'dir':          sig['dir'],
+        'score':        sig['score'],
+        'raw_score':    sig.get('raw_score', sig['score']),
+        'conf':         sig['conf'],
+        'entry':        sig['price'],
+        'sl':           sig['sl'],
+        'tp1':          sig['tp1'],
+        'tp2':          sig['tp'],
+        'tp3':          sig['tp3'],
+        'rr':           sig['rr'],
+        'risk_pct':     sig['risk_pct'],
+        'tags':         sig.get('tags', []),
+        'session':      session,
+        'weekly':       sig.get('weekly', 'neutral'),
+        'daily':        sig.get('daily', 'neutral'),
+        'rsi_val':      sig.get('rsi_val', 50),
+        'rsi_zone':     rsi_zone,
+        'time':         datetime.now(timezone.utc).isoformat(),
+        'status':       'open',
+        'exit_price':   None,
+        'exit_time':    None,
+        'pnl':          None,
+        'result':       None,
+        'bars_held':    None,
+    }
+    db['signals'].append(entry)
+    db['stats']['total_signals'] += 1
+    save_db(db)
+    return entry['id']
+
+# ── CLOSE A TRADE + LEARN ────────────────────────────────────────────
+def close_trade(trade_id, result, exit_price, bars_held=0):
+    """
+    result: 'win' | 'loss' | 'be'
+    This is the CORE learning moment — update stats and adjust weights
+    """
+    db = load_db()
+    sig = next((s for s in db['signals'] if s['id'] == trade_id), None)
+    if not sig:
+        return None
+
+    is_buy = sig['dir'] == 'BUY'
+    if exit_price:
+        pnl = ((exit_price - sig['entry']) / sig['entry'] * 100) if is_buy \
+              else ((sig['entry'] - exit_price) / sig['entry'] * 100)
+    else:
+        pnl = 0.0
+
+    sig['status']     = result
+    sig['result']     = result
+    sig['exit_price'] = exit_price
+    sig['exit_time']  = datetime.now(timezone.utc).isoformat()
+    sig['pnl']        = round(pnl, 3)
+    sig['bars_held']  = bars_held
+
+    # Update aggregate stats
+    db['stats']['total_trades'] += 1
+    db['stats']['total_pnl']    = round(db['stats']['total_pnl'] + pnl, 3)
+    if result == 'win':   db['stats']['wins']   += 1
+    elif result == 'loss': db['stats']['losses'] += 1
+    else:                  db['stats']['be']     += 1
+
+    # Update per-dimension stats
+    _update_dimension(db, 'by_setup',       sig['setup'],    result, pnl)
+    _update_dimension(db, 'by_session',     sig['session'],  result, pnl)
+    _update_dimension(db, 'by_rsi_zone',    sig['rsi_zone'], result, pnl)
+    _update_dimension(db, 'by_weekly',      sig['weekly'],   result, pnl)
+    score_bucket = f"{int(sig['score'])}-{int(sig['score'])+1}"
+    _update_dimension(db, 'by_score_range', score_bucket,    result, pnl)
+    for tag in sig.get('tags', []):
+        _update_dimension(db, 'by_tag', tag, result, pnl)
+
+    db['outcomes'].append(sig)
+    save_db(db)
+
+    # Auto-learn after every 5 trades
+    total = db['stats']['total_trades']
+    if total >= 10 and total % 5 == 0:
+        learn(db)
+
+    return sig
+
+def _update_dimension(db, dim, key, result, pnl):
+    if key not in db['stats'][dim]:
+        db['stats'][dim][key] = {'w':0,'l':0,'be':0,'total':0,'pnl':0.0}
+    d = db['stats'][dim][key]
+    d['total'] += 1
+    d['pnl']   = round(d['pnl'] + pnl, 3)
+    if result == 'win':   d['w'] += 1
+    elif result == 'loss': d['l'] += 1
+    else:                  d['be'] += 1
+
+# ── LEARNING ENGINE ──────────────────────────────────────────────────
+def learn(db):
+    """
+    Analyze completed trades and adjust weights.
+    Uses Bayesian-style update: weight += learning_rate * (actual - expected)
+    """
+    outcomes = [s for s in db['signals'] if s['result']]
+    if len(outcomes) < 10:
+        return  # not enough data
+
+    lr = 0.15  # learning rate — how fast to adjust
+    changes = []
+
+    # ── Learn setup scores ──────────────────────────────────────────
+    for setup, stats in db['stats']['by_setup'].items():
+        if stats['total'] < 5: continue
+        wr = stats['w'] / stats['total']
+        avg_pnl = stats['pnl'] / stats['total']
+        # Expected WR at current score
+        current_score = db['weights']['setup_scores'].get(setup, 7.0)
+        # If WR > 55% and positive PnL → increase base score
+        # If WR < 35% → decrease base score
+        if wr > 0.55 and avg_pnl > 0:
+            new_score = min(9.5, current_score + lr)
+            if abs(new_score - current_score) > 0.05:
+                db['weights']['setup_scores'][setup] = round(new_score, 2)
+                changes.append(f"↑ {setup} score {current_score:.1f}→{new_score:.1f} (WR:{wr:.0%})")
+        elif wr < 0.35 or avg_pnl < -1:
+            new_score = max(5.0, current_score - lr)
+            if abs(new_score - current_score) > 0.05:
+                db['weights']['setup_scores'][setup] = round(new_score, 2)
+                changes.append(f"↓ {setup} score {current_score:.1f}→{new_score:.1f} (WR:{wr:.0%})")
+
+    # ── Learn tag effectiveness ──────────────────────────────────────
+    for tag, stats in db['stats']['by_tag'].items():
+        if stats['total'] < 5: continue
+        wr = stats['w'] / stats['total']
+        current_w = db['weights']['tag_weights'].get(tag, 0.5)
+        if wr > 0.60:
+            new_w = min(2.5, current_w + lr*0.5)
+            if abs(new_w - current_w) > 0.05:
+                db['weights']['tag_weights'][tag] = round(new_w, 2)
+                changes.append(f"↑ tag '{tag}' weight {current_w:.2f}→{new_w:.2f} (WR:{wr:.0%})")
+        elif wr < 0.30:
+            new_w = max(0.1, current_w - lr*0.5)
+            if abs(new_w - current_w) > 0.05:
+                db['weights']['tag_weights'][tag] = round(new_w, 2)
+                changes.append(f"↓ tag '{tag}' weight {current_w:.2f}→{new_w:.2f} (WR:{wr:.0%})")
+
+    # ── Learn session effectiveness ──────────────────────────────────
+    for sess, stats in db['stats']['by_session'].items():
+        if stats['total'] < 5: continue
+        wr = stats['w'] / stats['total']
+        current_m = db['weights']['session_weights'].get(sess, 1.0)
+        target_m = 0.6 + wr * 1.2  # scales from 0.6 to 1.8
+        new_m = round(current_m + lr * (target_m - current_m), 2)
+        new_m = max(0.3, min(1.5, new_m))
+        if abs(new_m - current_m) > 0.05:
+            db['weights']['session_weights'][sess] = new_m
+            changes.append(f"{'↑' if new_m>current_m else '↓'} session '{sess}' mult {current_m:.2f}→{new_m:.2f} (WR:{wr:.0%})")
+
+    # ── Learn RSI zone effectiveness ─────────────────────────────────
+    for zone, stats in db['stats']['by_rsi_zone'].items():
+        if stats['total'] < 5: continue
+        wr = stats['w'] / stats['total']
+        current_m = db['weights']['rsi_zones'].get(zone, 1.0)
+        target_m = 0.5 + wr * 1.5
+        new_m = round(current_m + lr * (target_m - current_m), 2)
+        new_m = max(0.3, min(2.0, new_m))
+        if abs(new_m - current_m) > 0.05:
+            db['weights']['rsi_zones'][zone] = new_m
+            changes.append(f"RSI zone '{zone}': mult {current_m:.2f}→{new_m:.2f} (WR:{wr:.0%})")
+
+    if changes:
+        log_entry = {
+            'time':    datetime.now(timezone.utc).isoformat(),
+            'trades':  len(outcomes),
+            'changes': changes
+        }
+        db['learning_log'].append(log_entry)
+        db['last_learned'] = log_entry['time']
+
+    save_db(db)
+    return changes
+
+# ── COMPUTE SCORE USING LEARNED WEIGHTS ──────────────────────────────
+def compute_learned_score(setup, tags, session, weekly, rsi_val, base_score):
+    """
+    Returns adjusted score using learned weights.
+    Called instead of fixed score thresholds.
+    """
+    db = load_db()
+    w = db['weights']
+
+    # Start with learned setup base score
+    score = w['setup_scores'].get(setup, base_score)
+
+    # Add learned tag weights
+    for tag in tags:
+        tag_clean = tag.split('RSI')[0].strip()  # normalize RSI35, RSI42 etc
+        score += w['tag_weights'].get(tag_clean, 0.3)
+
+    # Apply session multiplier
+    score *= w['session_weights'].get(session, 1.0)
+
+    # Apply RSI zone multiplier
+    zone = get_rsi_zone(rsi_val)
+    score *= w['rsi_zones'].get(zone, 1.0)
+
+    # Apply weekly bias multiplier
+    score *= w['weekly_bias_mult'].get(weekly, 1.0)
+
+    return round(min(10, score), 1)
+
+def get_min_score(session):
+    """Dynamic minimum score threshold based on session"""
+    db = load_db()
+    return db['weights']['min_score_session'].get(session, 6.5)
+
+# ── HELPERS ──────────────────────────────────────────────────────────
+def get_rsi_zone(rsi):
+    if rsi < 30:   return '20-30'
+    if rsi < 40:   return '30-40'
+    if rsi < 50:   return '40-50'
+    if rsi < 60:   return '50-60'
+    if rsi < 70:   return '60-70'
+    return '70-80'
+
+def get_session():
+    h = datetime.now(timezone.utc).hour
+    d = datetime.now(timezone.utc).weekday()
+    if d >= 5: return 'Weekend'
+    if 7 <= h <= 12:  return 'London'
+    if 13 <= h <= 18: return 'New York'
+    return 'Asian'
+
+# ── PERFORMANCE REPORT ───────────────────────────────────────────────
+def performance_report():
+    db = load_db()
+    s = db['stats']
+    total = s['total_trades']
+    if total == 0:
+        return "📊 No completed trades yet. Learning begins after first trade closes."
+
+    wr = s['wins']/total*100 if total else 0
+    pf_num = s['wins'] * (s['total_pnl']/max(s['wins'],1)) if s['wins'] else 0
+    pf_den = s['losses'] * abs(s['total_pnl']/max(s['losses'],1)) if s['losses'] else 1
+    pf = pf_num/pf_den if pf_den else 0
+
+    lines = [
+        "🧠 <b>SMC Self-Learning Report</b>",
+        f"Based on {total} real trades\n",
+        f"✅ Wins:     {s['wins']} ({wr:.1f}%)",
+        f"❌ Losses:   {s['losses']}",
+        f"➡️ BE:        {s['be']}",
+        f"💰 Total P&amp;L: {s['total_pnl']:+.2f}%\n",
+        "<b>📊 Setup Performance:</b>",
+    ]
+
+    for setup, st in sorted(s['by_setup'].items(),
+                            key=lambda x: x[1]['w']/max(x[1]['total'],1), reverse=True):
+        if st['total'] < 2: continue
+        wr_s = st['w']/st['total']*100
+        bar = '█' * int(wr_s/10) + '░' * (10-int(wr_s/10))
+        learned = db['weights']['setup_scores'].get(setup, 7.0)
+        lines.append(f"  {'⚡📊🔄📈'[['SWEEP_OB','HTF_CONFLUENCE','CHOCH','BOS'].index(setup)] if setup in ['SWEEP_OB','HTF_CONFLUENCE','CHOCH','BOS'] else '📡'} "
+                     f"{setup}: {st['total']}tr WR:{wr_s:.0f}% {bar}")
+        lines.append(f"     Learned score: {learned:.1f}/10 | P&L: {st['pnl']:+.1f}%")
+
+    lines.append("\n<b>📅 Session Performance:</b>")
+    for sess, st in s['by_session'].items():
+        if st['total'] < 2: continue
+        wr_s = st['w']/st['total']*100
+        mult = db['weights']['session_weights'].get(sess, 1.0)
+        lines.append(f"  {sess}: {st['total']}tr WR:{wr_s:.0f}% → weight:{mult:.2f}x")
+
+    lines.append("\n<b>📈 Best performing tags:</b>")
+    tag_stats = [(t,v) for t,v in s['by_tag'].items() if v['total']>=3]
+    tag_stats.sort(key=lambda x: x[1]['w']/max(x[1]['total'],1), reverse=True)
+    for tag, st in tag_stats[:5]:
+        wr_t = st['w']/st['total']*100
+        w = db['weights']['tag_weights'].get(tag, 0.5)
+        lines.append(f"  {tag}: WR:{wr_t:.0f}% ({st['total']}tr) weight:{w:.2f}")
+
+    if db['learning_log']:
+        last = db['learning_log'][-1]
+        lines.append(f"\n<b>🧠 Last learning update:</b> {last['time'][:10]}")
+        for ch in last['changes'][:5]:
+            lines.append(f"  {ch}")
+
+    lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+    lines.append("📡 <b>SMC Engine Pro v3 — Self Learning</b>")
+    return '\n'.join(lines)
+
+def weekly_learning_report():
+    """Sent every Monday — what the engine learned this week"""
+    db = load_db()
+    recent = [s for s in db['signals']
+              if s.get('result') and
+              (datetime.now(timezone.utc).timestamp() -
+               datetime.fromisoformat(s['time']).timestamp()) < 7*24*3600]
+    if not recent:
+        return "📅 No trades completed this week."
+
+    wins   = [t for t in recent if t['result']=='win']
+    losses = [t for t in recent if t['result']=='loss']
+    pnl    = sum(t.get('pnl',0) or 0 for t in recent)
+    wr     = len(wins)/len(recent)*100
+
+    # What patterns show up in winners vs losers?
+    win_tags  = defaultdict(int)
+    loss_tags = defaultdict(int)
+    for t in wins:
+        for tag in t.get('tags',[]): win_tags[tag] += 1
+    for t in losses:
+        for tag in t.get('tags',[]): loss_tags[tag] += 1
+
+    lines = [
+        "📅 <b>Weekly Learning Report</b>",
+        f"Week trades: {len(recent)} | W:{len(wins)} L:{len(losses)}",
+        f"Win rate: {wr:.1f}% | P&amp;L: {pnl:+.2f}%\n",
+        "<b>🏆 Tags in winning trades:</b>",
+    ]
+    for tag, cnt in sorted(win_tags.items(), key=lambda x:-x[1])[:5]:
+        lines.append(f"  ✅ {tag}: {cnt} wins")
+    lines.append("<b>⚠️ Tags in losing trades:</b>")
+    for tag, cnt in sorted(loss_tags.items(), key=lambda x:-x[1])[:5]:
+        lines.append(f"  ❌ {tag}: {cnt} losses")
+
+    if db['learning_log']:
+        lines.append(f"\n<b>Weight changes this week:</b>")
+        week_logs = [l for l in db['learning_log']
+                     if (datetime.now(timezone.utc).timestamp() -
+                         datetime.fromisoformat(l['time']).timestamp()) < 7*24*3600]
+        for log in week_logs[-3:]:
+            for ch in log['changes'][:3]:
+                lines.append(f"  {ch}")
+
+    lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+    lines.append("📡 <b>SMC Engine — Self Learning v3</b>")
+    return '\n'.join(lines)
+
+
+# ════════════════════════════════════════════════
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -437,6 +896,17 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         if weekly_b == 'bearish': continue
         if not rsi_a[i] or not (25 < rsi_a[i] < 65): continue
 
+        # ── ANTI-TREND FILTER: Don't buy into a strong downtrend ──
+        # Check last 6 candles — if 5+ are bearish = strong downtrend, skip
+        recent = kl[max(0,i-6):i+1]
+        bearish_count = sum(1 for x in recent if x['c'] < x['o'])
+        if bearish_count >= 5: continue  # 5/6 red candles = skip BUY
+
+        # Price must be making higher lows recently (not lower lows)
+        recent_lows = [x['l'] for x in kl[max(0,i-4):i+1]]
+        if len(recent_lows) >= 3 and recent_lows[-1] < recent_lows[-3]*0.995:
+            continue  # still making lower lows = downtrend not reversed
+
         # Find the OB: last red candle before the swing low formed
         ob = None
         for j in range(li-1, max(0, li-15), -1):
@@ -483,6 +953,14 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         if daily_b != 'bearish': continue
         if weekly_b == 'bullish': continue
         if not rsi_a[i] or not (35 < rsi_a[i] < 75): continue
+
+        # Anti-trend filter for sells
+        recent = kl[max(0,i-6):i+1]
+        bullish_count = sum(1 for x in recent if x['c'] > x['o'])
+        if bullish_count >= 5: continue  # 5/6 green candles = skip SELL
+        recent_highs = [x['h'] for x in kl[max(0,i-4):i+1]]
+        if len(recent_highs) >= 3 and recent_highs[-1] > recent_highs[-3]*1.005:
+            continue  # still making higher highs = uptrend not reversed
         ob = None
         for j in range(hi_-1, max(0, hi_-15), -1):
             if kl[j]['c'] > kl[j]['o']:
@@ -616,9 +1094,21 @@ def compute(kl, pair, kl_btc=None):
 
     sig = get_signal(kl, sh, sl, i, closes, rsi_a, e9_a, e20_a, e50_a,
                      ht_a, atr_a, va_a, weekly_b, daily_b)
-    # Outside active session → require 1 extra point of confluence
-    effective_min = MIN_SCORE if session_on else MIN_SCORE + 1
+    # Use learned dynamic score instead of fixed threshold
+    session_name = get_session()
+    effective_min = get_min_score(session_name)
     if not sig or sig['score'] < effective_min: return None
+
+    # Compute learned score (adjusted by historical performance)
+    learned_score = compute_learned_score(
+        sig['setup'], sig.get('tags', []),
+        session_name, sig.get('weekly','neutral'),
+        rsi_a[i] or 50, sig['score']
+    )
+    sig = dict(sig)
+    sig['raw_score']    = sig['score']   # original score
+    sig['score']        = learned_score  # learned-adjusted score
+    sig['session_name'] = session_name
 
     # IMPROVEMENT 3: BTC correlation gate
     if pair['sym'] != 'BTC' and kl_btc:
@@ -850,93 +1340,259 @@ def send_tg(msg):
 
 # ── PRICE CHECK (for BE manager) ───────────────
 def check_prices():
-    """Price check every minute: BE management + win/loss auto-detection"""
     for sym, trade in list(state['open_trades'].items()):
         try:
-            pair = next(p for p in PAIRS if p['sym'] == sym)
-            r = requests.get(f'{CG}/simple/price',
-                params={'ids': pair['cg'], 'vs_currencies': 'usd'},
-                timeout=8)
-            price = r.json()[pair['cg']]['usd']
+            pair   = next(p for p in PAIRS if p['sym'] == sym)
+            r      = requests.get(f'{CG}/simple/price',
+                       params={'ids': pair['cg'], 'vs_currencies': 'usd'},
+                       timeout=8)
+            price  = float(r.json()[pair['cg']]['usd'])
             if not price: continue
-
             is_buy = trade['dir'] == 'BUY'
+            entry  = trade['entry']
             sl_p   = trade['sl']
-            tp_p   = trade['tp']
             tp1_p  = trade['tp1']
+            tp2_p  = trade['tp']
+            tp3_p  = trade.get('tp3', tp2_p)
 
-            # ── BREAKEVEN: TP1 hit → alert to move SL ──
-            if not trade.get('be_triggered') and tp1_p:
-                tp1_hit = (is_buy and price >= tp1_p) or (not is_buy and price <= tp1_p)
-                if tp1_hit:
+            # TP1: Breakeven
+            if not trade.get('be_triggered'):
+                if (is_buy and price>=tp1_p) or (not is_buy and price<=tp1_p):
                     trade['be_triggered'] = True
-                    check_breakeven(sym, price)
+                    pnl1 = round(abs(tp1_p-entry)/entry*100,2)
+                    send_tg(
+                        f"🎯 <b>TP1 HIT — {sym}/USD +{pnl1}%</b>\n\n"
+                        f"✅ Close 50% at <code>{fp(price)}</code>\n"
+                        f"🔒 Move SL to entry: <code>{fp(entry)}</code>\n\n"
+                        f"🎯 TP2 target: <code>{fp(tp2_p)}</code>\n"
+                        f"🎯 TP3 runner: <code>{fp(tp3_p)}</code>\n\n"
+                        f"<i>Trade is now risk-free. Let it run.</i>\n"
+                        f"📐 {trade.get('setup_name','—')}  |  📡 SMC Engine Pro v3"
+                    )
+                    log.info(f"  🎯 {sym}: TP1 hit +{pnl1}%")
 
-            # ── WIN: TP2 hit ──
-            tp_hit = (is_buy and price >= tp_p) or (not is_buy and price <= tp_p)
-            if tp_hit:
-                pnl = round(abs(tp_p - trade['entry']) / trade['entry'] * 100, 2)
-                msg = build_result_msg(sym, 'WIN', pnl, trade)
-                send_tg(msg)
-                journal_close_trade(sym, 'win', tp_p)
-                state['stats']['wins'] = state['stats'].get('wins', 0) + 1
-                state['stats'].setdefault('by_setup', {}).setdefault(trade.get('setup','?'), {'w':0,'l':0,'be':0})
-                state['stats']['by_setup'][trade.get('setup','?')]['w'] += 1
-                log.info(f"  ✅ WIN: {sym} +{pnl}% → TG sent")
-                del state['open_trades'][sym]
-                continue
+            # TP2: WIN
+            if not trade.get('tp2_hit'):
+                if (is_buy and price>=tp2_p) or (not is_buy and price<=tp2_p):
+                    trade['tp2_hit'] = True
+                    pnl = round(abs(tp2_p-entry)/entry*100,2)
+                    analysis = _analyze_win(trade)
+                    send_tg(
+                        f"✅ <b>WIN — {sym}/USD +{pnl}%</b>\n\n"
+                        f"⚡ Setup: {trade.get('setup_name','—')}\n"
+                        f"📊 Score: {trade.get('score',0)}/10  |  R:R 1:{trade.get('rr',0)}\n\n"
+                        f"💰 Entry: <code>{fp(entry)}</code>\n"
+                        f"🎯 Exit:  <code>{fp(price)}</code>  (+{pnl}%)\n"
+                        f"⏱ Held: {_hours_held(trade)}\n\n"
+                        f"🏆 <b>Why it worked:</b>\n{analysis}\n\n"
+                        f"🎯 TP3 runner still open: <code>{fp(tp3_p)}</code>\n"
+                        f"   Trail SL to TP1 level now\n\n"
+                        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3"
+                    )
+                    lid = trade.get('learn_id')
+                    if lid: close_trade(lid,'win',price)
+                    journal_close_trade(sym,'win',price)
+                    state['stats']['wins'] = state['stats'].get('wins',0)+1
+                    _upd_stat(trade.get('setup','?'),'w')
+                    log.info(f"  ✅ WIN: {sym} +{pnl}%")
+                    del state['open_trades'][sym]; continue
 
-            # ── LOSS: SL hit ──
-            sl_hit = (is_buy and price <= sl_p) or (not is_buy and price >= sl_p)
-            if sl_hit:
-                pnl = round(abs(sl_p - trade['entry']) / trade['entry'] * 100, 2)
-                msg = build_result_msg(sym, 'LOSS', -pnl, trade)
-                send_tg(msg)
-                journal_close_trade(sym, 'loss', sl_p)
-                state['stats']['losses'] = state['stats'].get('losses', 0) + 1
-                state['stats'].setdefault('by_setup', {}).setdefault(trade.get('setup','?'), {'w':0,'l':0,'be':0})
-                state['stats']['by_setup'][trade.get('setup','?')]['l'] += 1
-                log.info(f"  ❌ LOSS: {sym} -{pnl}% → TG sent")
-                del state['open_trades'][sym]
-                continue
+            # TP3: Runner
+            if trade.get('tp2_hit') and not trade.get('tp3_hit'):
+                if (is_buy and price>=tp3_p) or (not is_buy and price<=tp3_p):
+                    trade['tp3_hit'] = True
+                    pnl = round(abs(tp3_p-entry)/entry*100,2)
+                    send_tg(
+                        f"🚀 <b>RUNNER HIT — {sym}/USD +{pnl}%</b>\n\n"
+                        f"TP3 reached! Full exit.\n"
+                        f"📐 {trade.get('setup_name','—')}  |  "
+                        f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
+                    )
+                    continue
 
-        except: pass
+            # SL: LOSS
+            if (is_buy and price<=sl_p) or (not is_buy and price>=sl_p):
+                pnl = round(abs(sl_p-entry)/entry*100,2)
+                analysis = _analyze_loss(trade, price)
+                send_tg(
+                    f"❌ <b>LOSS — {sym}/USD -{pnl}%</b>\n\n"
+                    f"📐 Setup: {trade.get('setup_name','—')}\n"
+                    f"📊 Score was: {trade.get('score',0)}/10\n\n"
+                    f"💰 Entry:  <code>{fp(entry)}</code>\n"
+                    f"🛑 SL hit: <code>{fp(price)}</code>  (-{pnl}%)\n"
+                    f"⏱ Held: {_hours_held(trade)}\n\n"
+                    f"🔍 <b>Failure Analysis:</b>\n{analysis}\n\n"
+                    f"📚 <i>Engine is learning from this trade.</i>\n"
+                    f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3"
+                )
+                lid = trade.get('learn_id')
+                if lid: close_trade(lid,'loss',price)
+                journal_close_trade(sym,'loss',price)
+                state['stats']['losses'] = state['stats'].get('losses',0)+1
+                _upd_stat(trade.get('setup','?'),'l')
+                log.info(f"  ❌ LOSS: {sym} -{pnl}%")
+                del state['open_trades'][sym]; continue
+
+        except Exception as e:
+            log.debug(f"check_prices {sym}: {e}")
         time.sleep(0.5)
 
-# ── SCAN ───────────────────────────────────────
+def _hours_held(trade):
+    try:
+        secs = time.time()-datetime.fromisoformat(trade['time']).timestamp()
+        return f"{int(secs//3600)}h {int((secs%3600)//60)}m"
+    except: return '—'
+
+def _upd_stat(setup, result):
+    state['stats'].setdefault('by_setup',{})
+    state['stats']['by_setup'].setdefault(setup,{'w':0,'l':0,'be':0})
+    state['stats']['by_setup'][setup][result]+=1
+
+def _analyze_win(trade):
+    lines=[]; tags=trade.get('tags',[]); sess=trade.get('session_name','')
+    if 'RSI_Div✓' in tags: lines.append("  ✅ RSI divergence confirmed reversal")
+    if any('Sweep' in t for t in tags): lines.append("  ✅ Liquidity sweep cleared stops perfectly")
+    if 'OB_Retest' in tags: lines.append("  ✅ OB zone defended by institutions")
+    if 'Vol✓' in tags: lines.append("  ✅ Volume surge confirmed smart money")
+    if any('EMA' in t for t in tags): lines.append("  ✅ EMA stack aligned with direction")
+    if sess in ('London','New York'): lines.append(f"  ✅ Active {sess} session — high quality")
+    if 'MACD✓' in tags: lines.append("  ✅ MACD momentum confirmed")
+    if trade.get('weekly') in ('bullish','bearish'): lines.append("  ✅ Weekly trend supported move")
+    return '\n'.join(lines) if lines else "  ✅ All confluence factors aligned"
+
+def _analyze_loss(trade, exit_price):
+    lines=[]; tags=trade.get('tags',[]); is_buy=trade['dir']=='BUY'
+    weekly=trade.get('weekly','neutral'); daily=trade.get('daily','neutral')
+    rsi=trade.get('rsi_val',50); sess=trade.get('session_name','')
+    score=trade.get('score',0); entry=trade['entry']; setup=trade.get('setup','')
+    move_pct=abs(exit_price-entry)/entry*100
+
+    # Trend issues
+    if is_buy and weekly=='bearish': lines.append("  ⚠️ BUY taken against weekly bearish trend")
+    if not is_buy and weekly=='bullish': lines.append("  ⚠️ SELL taken against weekly bullish trend")
+    if is_buy and daily=='bearish': lines.append("  ⚠️ Daily bias bearish — against trade direction")
+    if not is_buy and daily=='bullish': lines.append("  ⚠️ Daily bias bullish — against trade direction")
+    # RSI issues
+    if is_buy and rsi>62: lines.append(f"  ⚠️ RSI {rsi} — overbought for BUY entry")
+    if not is_buy and rsi<38: lines.append(f"  ⚠️ RSI {rsi} — oversold for SELL entry")
+    # Session
+    if sess=='Weekend': lines.append("  ⚠️ Weekend — low volume, fake sweeps common")
+    if sess=='Asian': lines.append("  ⚠️ Asian session — choppy, low institutional activity")
+    # Score
+    if score<=7: lines.append(f"  ⚠️ Marginal score ({score}/10) — weak confluence")
+    # Missing confirmations
+    if 'RSI_Div✓' not in tags: lines.append("  ⚠️ No RSI divergence — reversal unconfirmed")
+    if 'Vol✓' not in tags: lines.append("  ⚠️ Low volume — no institutional confirmation")
+    # Stop distance
+    if move_pct<0.3: lines.append(f"  ℹ️ Stopped immediately — entry timing was off")
+    elif move_pct<0.8: lines.append(f"  ℹ️ SL may have been too tight for this volatility")
+    if not lines: lines.append("  ℹ️ Valid setup — market conditions changed unexpectedly")
+    lines.append(f"\n  🧠 Adjusting {setup} weights to reduce similar losses")
+    return '\n'.join(lines)
+
+
+def build_signal_msg(sig, pair):
+    is_buy = sig['dir'] == 'BUY'
+    emojis = {'SWEEP_OB':'⚡','HTF_CONFLUENCE':'📊','CHOCH':'🔄','BOS':'📈'}
+    e = emojis.get(sig['setup'], '📡')
+    tips = {
+        'SWEEP_OB':       f"Institutions swept retail stops at {fp(sig.get('swept',sig['price']))}. OB retest entry. SL below wick.",
+        'HTF_CONFLUENCE': 'Weekly + Daily + 1h EMA stacks all aligned. Trend continuation.',
+        'CHOCH':          'Change of Character — structural shift. Early reversal, tight SL.',
+        'BOS':            'Break of Structure confirmed. Trend continuation with clean swings.',
+    }
+    risk = abs(sig['price'] - sig['sl'])
+    is_b = sig['dir'] == 'BUY'
+    tp3  = sig.get('tp3', sig['price'] + risk*3 if is_b else sig['price'] - risk*3)
+    lines = [
+        f"{'🟢' if is_buy else '🔴'} <b>{sig['dir']} — {pair['sym']}/USD</b>",
+        f"{e} <b>Setup: {esc(sig['name'])}</b>", '',
+        f"📌 <i>{tips.get(sig['setup'],'SMC confluence setup.')}</i>", '',
+        '💰 <b>Trade Levels</b>',
+        f"  Entry:  <code>{fp(sig['price'])}</code>",
+        f"  SL:     <code>{fp(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%)</i>",
+        f"  TP1:    <code>{fp(sig['tp1'])}</code>  <i>(1:2 — close 50%, move SL to BE)</i>",
+        f"  TP2:    <code>{fp(sig['tp'])}</code>   <i>(1:{sig['rr']} — main target)</i>",
+        f"  TP3:    <code>{fp(tp3)}</code>  <i>(1:3 — runner)</i>", '',
+        f"📊 <b>Score: {sig['score']}/10  |  Conf: {sig['conf']}%  |  R:R 1:{sig['rr']}</b>",
+        f"  Confluences: {esc(' · '.join(sig['tags']))}",
+        f"  Weekly: {esc(sig.get('weekly','—'))}  |  Daily: {esc(sig.get('daily','—'))}  |  RSI: {sig.get('rsi_val','—')}",
+    ]
+    if sig.get('ob'):
+        lines.append(f"  OB Zone: {fp(sig['ob']['bot'])} – {fp(sig['ob']['top'])}")
+    if sig.get('swept'):
+        lines.append(f"  Swept at: {fp(sig['swept'])}")
+    lines += [
+        '', '📋 <b>Trade Management:</b>',
+        '  • At TP1 → close 50% of position',
+        '  • Move SL to breakeven (entry)',
+        '  • Let remaining run to TP2, then TP3',
+        '', '⚠️ <i>Not financial advice. Always manage risk.</i>',
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v3</b>",
+    ]
+    return '\n'.join(l for l in lines if l is not None)
+
+def build_result_msg(sym, result, pnl, trade):
+    e = '✅' if result == 'WIN' else '❌'
+    return '\n'.join([
+        f"{e} <b>TRADE {result} — {sym}/USD  {'+' if pnl>=0 else ''}{pnl:.2f}%</b>", '',
+        f"📐 Setup: {trade.get('setup_name','—')}",
+        f"💰 Entry: {fp(trade.get('entry',0))}",
+        f"{'🎯' if result=='WIN' else '🛑'} Exit: {fp(trade.get('tp' if result=='WIN' else 'sl',0))}",
+        f"📊 Score: {trade.get('score',0)}/10",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3",
+    ])
+
+def esc(s):
+    return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+
+def send_tg(msg):
+    if not TG_TOKEN or not TG_CHAT: return False
+    try:
+        r = requests.post(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            json={'chat_id':TG_CHAT,'text':msg,'parse_mode':'HTML',
+                  'disable_web_page_preview':True},
+            timeout=10)
+        if r.ok: return True
+        err = r.json().get('description','unknown')
+        log.error(f"TG failed: {err}")
+        # Retry plain
+        r2 = requests.post(
+            f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            json={'chat_id':TG_CHAT,'text':msg[:4000],'disable_web_page_preview':True},
+            timeout=10)
+        return r2.ok
+    except Exception as e:
+        log.error(f"TG exception: {e}"); return False
+
+def saveTG():
+    pass  # config via env vars only
+
 def run_scan():
     state['scans_done'] += 1
     state['last_scan'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     log.info(f"Scan #{state['scans_done']} — {len(PAIRS)} pairs")
-    # Circuit breaker: pause after 3 consecutive losses
     if check_circuit_breaker():
-        log.warning("Circuit breaker active — skipping scan")
-        return
-
-    # Fetch BTC first for correlation gate
+        log.warning("Circuit breaker active — skipping scan"); return
     kl_btc = None
     try:
         kl_btc = fetch_candles(PAIRS[0], limit=300)
-        if not kl_btc: log.warning("BTC candles failed")
     except: pass
-
     for pair in PAIRS:
         try:
-            kl = kl_btc if pair['sym'] == 'BTC' else fetch_candles(pair, limit=300)
-            if not kl:
-                log.info(f"  {pair['sym']}: no data"); continue
-
-            sig = compute(kl, pair, kl_btc if pair['sym'] != 'BTC' else None)
-
+            kl = kl_btc if pair['sym']=='BTC' else fetch_candles(pair, limit=300)
+            if not kl: log.info(f"  {pair['sym']}: no data"); continue
+            sig = compute(kl, pair, kl_btc if pair['sym']!='BTC' else None)
             if sig:
                 msg = build_signal_msg(sig, pair)
                 ok  = send_tg(msg)
                 if ok:
                     last_fired[pair['sym']] = {'time': time.time()}
                     state['alerts_sent'] += 1
-                    journal_log_signal(sig, pair)  # 📓 Log to journal
-                    # Track for BE management (IMPROVEMENT 5)
-                    state['open_trades'][pair['sym']] = {
+                    session_now = get_session()
+                    learn_id = log_signal(sig, pair, session_now)
+                    trade_entry = {
                         'dir':        sig['dir'],
                         'setup':      sig['setup'],
                         'setup_name': sig['name'],
@@ -944,133 +1600,154 @@ def run_scan():
                         'sl':         sig['sl'],
                         'tp':         sig['tp'],
                         'tp1':        sig['tp1'],
-                        'tp3':        sig['tp3'],
+                        'tp3':        sig.get('tp3', sig['tp']),
                         'score':      sig['score'],
-                        'time':       time.time(),
+                        'rr':         sig['rr'],
+                        'time':       datetime.now(timezone.utc).isoformat(),
                         'be_triggered': False,
+                        'tp2_hit':    False,
+                        'tp3_hit':    False,
+                        'tags':       sig.get('tags',[]),
+                        'weekly':     sig.get('weekly','neutral'),
+                        'daily':      sig.get('daily','neutral'),
+                        'rsi_val':    sig.get('rsi_val',50),
+                        'session_name': session_now,
+                        'learn_id':   learn_id,
                     }
-                    log.info(f"  ✓ {pair['sym']}: {sig['name']} {sig['dir']} "
-                             f"score={sig['score']} conf={sig['conf']}% → TG sent")
+                    state['open_trades'][pair['sym']] = trade_entry
+                    journal_log_signal(sig, pair)
+                    log.info(f"  ✓ {pair['sym']}: {sig['name']} {sig['dir']} score={sig['score']} → TG sent")
                 else:
-                    log.error(f"  {pair['sym']}: TG send failed")
+                    log.error(f"  {pair['sym']}: TG failed")
             else:
                 log.info(f"  {pair['sym']}: no setup")
-
-            time.sleep(0.8)  # rate limit — faster scan
-
+            time.sleep(0.8)
         except Exception as e:
             log.error(f"  {pair['sym']} error: {e}")
+    log.info(f"Scan done. Alerts: {state['alerts_sent']}")
 
-    log.info(f"Scan done. Total alerts: {state['alerts_sent']}")
-
-# ── MAIN ───────────────────────────────────────
 def main():
     if not TG_TOKEN or not TG_CHAT:
-        log.error("Missing TG_TOKEN or TG_CHAT environment variables")
-        log.error("Set them in Railway → Variables tab")
-        raise SystemExit(1)
-
+        log.error("Missing TG_TOKEN or TG_CHAT"); raise SystemExit(1)
     log.info("="*55)
-    log.info("SMC ENGINE PRO v3 — 24/7 ALERT SERVER")
-    # Print token info for debugging (first/last 6 chars only)
+    log.info("SMC ENGINE PRO v3 — 24/7 SELF-LEARNING SERVER")
     if TG_TOKEN:
         log.info(f"TG_TOKEN: {TG_TOKEN[:15]}...{TG_TOKEN[-6:]} (len={len(TG_TOKEN)})")
-    else:
-        log.info("TG_TOKEN: NOT SET")
-    log.info(f"TG_CHAT:  {TG_CHAT}")
-    log.info(f"Pairs: {len(PAIRS)} | Score≥{MIN_SCORE} (off-session: {MIN_SCORE+1}) | Every {SCAN_EVERY}m")
-    log.info(f"Interval: {SCAN_EVERY}m | Cooldown: {COOLDOWN_M}m")
+    log.info(f"TG_CHAT: {TG_CHAT}")
+    log.info(f"Pairs: {len(PAIRS)} | Score≥{MIN_SCORE}(off-session:{MIN_SCORE+1}) | Every {SCAN_EVERY}m")
     log.info(f"Sessions: London 07-12 UTC | NY 13-18 UTC")
-    log.info(f"Filters:  Weekly gate | BTC gate | Struct SL | BE mgmt")
+    log.info(f"Filters: Weekly gate | BTC gate | Struct SL | BE mgmt | Self-learning")
     log.info("="*55)
 
-    # Start health server (Railway needs this)
     threading.Thread(target=start_health, daemon=True).start()
-    log.info(f"Health server started on port {PORT}")
+    log.info(f"Health server on port {PORT}")
 
-    # Startup message
     send_tg(
-        "🚀 <b>SMC Engine Pro v3 Started</b>\n\n"
-        "<b>5 improvements active:</b>\n"
-        "1️⃣ Session filter — London + NY only\n"
-        "2️⃣ Weekly bias gate — no counter-trend trades\n"
-        "3️⃣ BTC correlation — altcoins aligned with BTC\n"
-        "4️⃣ Structure SL — SL at swept wick / OB level\n"
-        "5️⃣ Breakeven alerts — auto-alert when TP1 hit\n\n"
-        "<b>Setups (priority order):</b>\n"
-        "⚡ Sweep + OB Retest\n"
-        "📊 3-TF HTF Confluence\n"
-        "🔄 CHoCH Reversal\n"
-        "📈 BOS Continuation\n\n"
-        f"Scanning 10 pairs every 1 minute 📡\n"
-        "Laptop can be off — alerts arrive 24/7\n\n"
-        "📡 <b>SMC Engine Pro v3</b>"
+        "🚀 <b>SMC Engine Pro v3 — Self Learning Started</b>\n\n"
+        "<b>Settings:</b>\n"
+        f"⏱ Scan every: {SCAN_EVERY} minute\n"
+        f"🔁 Cooldown: {COOLDOWN_M} min\n"
+        f"📊 Min score: {MIN_SCORE}/10\n\n"
+        "<b>Alerts you will receive:</b>\n"
+        "📡 Signal → Entry/SL/TP1/TP2/TP3 levels\n"
+        "🎯 TP1 hit → move SL to breakeven\n"
+        "✅ TP2 hit → WIN + why it worked\n"
+        "🚀 TP3 hit → runner closed\n"
+        "❌ SL hit → LOSS + failure analysis\n"
+        "📅 Every Monday → weekly learning report\n\n"
+        "<b>Commands:</b>\n"
+        "/stats /learn /weights /weekly /open /help\n\n"
+        "📡 <b>SMC Engine Pro v3 — Self Learning</b>"
     )
     log.info("✓ Startup TG message sent")
 
-    # BE price check loop (every 60s in background)
     def be_loop():
         while True:
             try:
-                if state['open_trades']:
-                    check_prices()
+                if state['open_trades']: check_prices()
             except Exception as e:
                 log.debug(f"BE check error: {e}")
             time.sleep(60)
     threading.Thread(target=be_loop, daemon=True).start()
 
-    # Telegram command listener (every 30s)
-    # Supports: /stats /report /open /weekly
+    def weekly_report_loop():
+        while True:
+            now = datetime.now(timezone.utc)
+            if now.weekday()==0 and now.hour==8 and now.minute<5:
+                send_tg(weekly_learning_report())
+                log.info("Weekly learning report sent")
+                time.sleep(300)
+            time.sleep(60)
+    threading.Thread(target=weekly_report_loop, daemon=True).start()
+
     last_update_id = [0]
     def tg_commands():
         while True:
             try:
                 r = requests.get(
                     f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates',
-                    params={'offset': last_update_id[0]+1, 'timeout': 10},
-                    timeout=15
-                )
+                    params={'offset':last_update_id[0]+1,'timeout':10},
+                    timeout=15)
                 if r.ok:
-                    for upd in r.json().get('result', []):
+                    for upd in r.json().get('result',[]):
                         last_update_id[0] = upd['update_id']
                         txt = upd.get('message',{}).get('text','').strip().lower()
                         if txt in ('/stats','/report','/journal'):
-                            # Combine journal + live session stats
+                            w=state['stats'].get('wins',0); l=state['stats'].get('losses',0)
+                            b=state['stats'].get('be',0); tot=w+l+b
                             journal_msg = journal_stats_report()
-                            w=state['stats'].get('wins',0); l=state['stats'].get('losses',0); b=state['stats'].get('be',0)
-                            tot=w+l+b
-                            sess_msg=(
+                            sess_msg = (
                                 f"\n\n📊 <b>This Session:</b>\n"
-                                f"  ✅ Wins:    {w}\n"
-                                f"  ❌ Losses:  {l}\n"
-                                f"  ➡️ BE:       {b}\n"
+                                f"  ✅ Wins:   {w}\n  ❌ Losses: {l}\n  ➡️ BE: {b}\n"
                                 f"  WR: {round(w/tot*100) if tot else 0}%\n"
                                 f"  Open: {len(state['open_trades'])}\n"
                                 f"  Alerts sent: {state['alerts_sent']}"
                             )
                             send_tg(journal_msg + sess_msg)
+                        elif txt in ('/learn','/learning','/ml'):
+                            send_tg(performance_report())
+                        elif txt == '/weights':
+                            db = load_db()
+                            w_d = db['weights']
+                            lines = ["⚖️ <b>Learned Weights</b>\n","<b>Setup scores:</b>"]
+                            for s,v in w_d['setup_scores'].items():
+                                lines.append(f"  {s}: {v:.2f}")
+                            lines.append("\n<b>Session multipliers:</b>")
+                            for s,v in w_d['session_weights'].items():
+                                lines.append(f"  {s}: {v:.2f}x")
+                            lines.append("\n<b>Top tag weights:</b>")
+                            for t,v in sorted(w_d['tag_weights'].items(),key=lambda x:-x[1])[:8]:
+                                lines.append(f"  {t}: {v:.2f}")
+                            send_tg('\n'.join(lines))
+                        elif txt == '/weekly':
+                            send_tg(weekly_learning_report())
                         elif txt == '/open':
-                            j = load_journal()
-                            if j['open']:
+                            if state['open_trades']:
                                 msg = "🔓 <b>Open trades:</b>\n" + "\n".join(
-                                    f"  • {sym}" for sym in j['open'])
+                                    f"  • {sym}: {v['dir']} {v.get('setup','?')} @ {fp(v['entry'])}"
+                                    for sym,v in state['open_trades'].items())
                             else:
                                 msg = "✅ No open trades right now"
                             send_tg(msg)
+                        elif txt == '/reset_weights':
+                            db = load_db(); db['weights']=DEFAULT_WEIGHTS.copy(); save_db(db)
+                            send_tg("✅ Weights reset to defaults")
                         elif txt == '/help':
                             send_tg(
                                 "📡 <b>SMC Bot Commands</b>\n\n"
-                                "/stats — full performance report\n"
-                                "/open  — show open trades\n"
-                                "/help  — show this menu"
+                                "/stats   — performance report\n"
+                                "/learn   — self-learning report\n"
+                                "/weights — learned weights\n"
+                                "/weekly  — weekly summary\n"
+                                "/open    — open trades\n"
+                                "/help    — this menu"
                             )
             except Exception as e:
-                log.debug(f"TG command error: {e}")
+                log.debug(f"TG cmd error: {e}")
             time.sleep(30)
     threading.Thread(target=tg_commands, daemon=True).start()
-    log.info("✓ Telegram command listener started (/stats /open /help)")
+    log.info("✓ TG command listener started")
 
-    # Main scan loop
     while True:
         try:
             run_scan()
