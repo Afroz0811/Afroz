@@ -398,38 +398,93 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     price = kl[i]['c']; k = kl[i]
     at = atr_a[i]; va_v = va_a[i]
 
-    # ── SETUP 1: SWEEP + OB ─────────────────────
-    for li, lvl in [(ix,p) for ix,p in sl_sw if ix < i-1 and ix > i-50][-4:]:
-        if not (k['l'] < lvl < price): continue
-        if lvl - k['l'] < at*0.28: continue
-        if k['v'] < va_v*1.15: continue
+    # ── SETUP 1: SWEEP + OB RETEST ──────────────
+    #
+    # HOW IT WORKS:
+    # 1. Price forms equal lows (liquidity resting below)
+    # 2. A sweep candle wicks BELOW those lows (stop hunt) and CLOSES back above
+    # 3. We find the OB: last bearish (red) candle BEFORE the sweep — that's where
+    #    institutions placed their buy orders
+    # 4. Signal fires when price RETESTS that OB zone (comes back into it)
+    # 5. SL = just below the sweep wick low (tight, precise)
+    #
+    # Two scenarios detected:
+    # A) i IS the sweep candle (fires immediately when close is back in OB)
+    # B) i is a retest candle AFTER the sweep (1-5 bars later, price in OB)
+
+    for li, lvl in [(ix,p) for ix,p in sl_sw if ix < i and ix > i-50][-4:]:
+
+        # ── Scenario A: current candle swept AND closed back in OB ──
+        sweep_bar = None; wick_low_val = None
+        if k['l'] < lvl and price > lvl:
+            if lvl - k['l'] < at*0.25: continue    # wick must be meaningful
+            if k['v'] < va_v*1.15: continue         # volume surge required
+            sweep_bar = i; wick_low_val = k['l']
+
+        # ── Scenario B: sweep happened 1-8 bars ago, now retesting OB ──
+        elif li <= i-1 and li >= i-8:
+            # Find the sweep candle in history
+            sc = next((kl[j] for j in range(li, min(li+4, i+1))
+                       if kl[j]['l'] < lvl and kl[j]['c'] > lvl), None)
+            if sc and sc['v'] > va_v*1.1:
+                sweep_bar = li; wick_low_val = sc['l']
+            else:
+                continue
+        else:
+            continue
+
         if daily_b != 'bullish': continue
-        if weekly_b == 'bearish': continue   # IMPROVEMENT 2
-        if not rsi_a[i] or not (25 < rsi_a[i] < 62): continue
+        if weekly_b == 'bearish': continue
+        if not rsi_a[i] or not (25 < rsi_a[i] < 65): continue
+
+        # Find the OB: last red candle before the swing low formed
         ob = None
-        for j in range(li-1, max(0, li-12), -1):
-            if kl[j]['c'] < kl[j]['o']:
+        for j in range(li-1, max(0, li-15), -1):
+            if kl[j]['c'] < kl[j]['o']:  # red candle = bullish OB
                 fwd = (kl[min(j+2,len(kl)-1)]['c'] - kl[j]['c']) / kl[j]['c']
-                if fwd > 0.003:
-                    ob = {'top': kl[j]['o'], 'bot': kl[j]['l']}; break
-        if not ob or not (ob['bot'] <= price <= ob['top']*1.005): continue
+                if fwd > 0.003:           # followed by bullish move
+                    ob = {'top': kl[j]['o'], 'bot': kl[j]['l']}
+                    break
+
+        if not ob: continue
+
+        # Price must be IN the OB zone to fire
+        if not (ob['bot'] <= price <= ob['top']*1.008): continue
+
         ema_ok = e20_a[i] and e50_a[i] and price > e20_a[i] > e50_a[i]
+        score  = 8 + (0.5 if ema_ok else 0)
+
         return {'dir':'BUY', 'setup':'SWEEP_OB',
                 'name':'⚡ Liq Sweep + OB Retest',
-                'score': 8+(0.5 if ema_ok else 0),
-                'ob': ob, 'swept': lvl,
+                'score': score,
+                'ob': ob,
+                'swept': lvl,
+                'wick_low': wick_low_val,   # exact wick for tight SL
                 'tags': ['Sweep↑','OB_Retest','Vol✓','HTF✓','Week✓']
-                       +((['EMA↑'] if ema_ok else []))+[f'RSI{round(rsi_a[i])}']}
+                       +(['EMA↑'] if ema_ok else [])+[f'RSI{round(rsi_a[i])}']}
 
-    for hi_, lvl in [(ix,p) for ix,p in sh if ix < i-1 and ix > i-50][-4:]:
-        if not (k['h'] > lvl > price): continue
-        if k['h'] - lvl < at*0.28: continue
-        if k['v'] < va_v*1.15: continue
+    for hi_, lvl in [(ix,p) for ix,p in sh if ix < i and ix > i-50][-4:]:
+
+        sweep_bar_s = None; wick_high_val = None
+        if k['h'] > lvl and price < lvl:
+            if k['h'] - lvl < at*0.25: continue
+            if k['v'] < va_v*1.15: continue
+            sweep_bar_s = i; wick_high_val = k['h']
+        elif hi_ <= i-1 and hi_ >= i-8:
+            sc = next((kl[j] for j in range(hi_, min(hi_+4, i+1))
+                       if kl[j]['h'] > lvl and kl[j]['c'] < lvl), None)
+            if sc and sc['v'] > va_v*1.1:
+                sweep_bar_s = hi_; wick_high_val = sc['h']
+            else:
+                continue
+        else:
+            continue
+
         if daily_b != 'bearish': continue
-        if weekly_b == 'bullish': continue   # IMPROVEMENT 2
-        if not rsi_a[i] or not (38 < rsi_a[i] < 75): continue
+        if weekly_b == 'bullish': continue
+        if not rsi_a[i] or not (35 < rsi_a[i] < 75): continue
         ob = None
-        for j in range(hi_-1, max(0, hi_-12), -1):
+        for j in range(hi_-1, max(0, hi_-15), -1):
             if kl[j]['c'] > kl[j]['o']:
                 fwd = (kl[min(j+2,len(kl)-1)]['c'] - kl[j]['c']) / kl[j]['c']
                 if fwd < -0.003:
@@ -440,8 +495,9 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                 'name':'⚡ Liq Sweep + OB Retest',
                 'score': 8+(0.5 if ema_ok else 0),
                 'ob': ob, 'swept': lvl,
+                'wick_high': wick_high_val,
                 'tags': ['Sweep↓','OB_Retest','Vol✓','HTF✓','Week✓']
-                       +((['EMA↓'] if ema_ok else []))+[f'RSI{round(rsi_a[i])}']}
+                       +(['EMA↓'] if ema_ok else [])+[f'RSI{round(rsi_a[i])}']}
 
     # ── SETUP 2: 3-TF HTF CONFLUENCE ────────────
     if i >= 50 and ht_a[i] and weekly_b != 'neutral' and weekly_b == daily_b:
@@ -615,13 +671,9 @@ def compute(kl, pair, kl_btc=None):
     # IMPROVEMENT 4: Structure-based SL (setup-specific)
     ob_level = (sig['ob']['bot'] if is_buy else sig['ob']['top']) if sig.get('ob') else None
 
-    # For SWEEP_OB: find the actual wick low/high of the sweep candle
-    wick_low = wick_high = None
-    if sig['setup'] == 'SWEEP_OB':
-        # Find the candle that swept — it's the current candle (i)
-        # Its low IS the swept wick
-        wick_low  = kl[i]['l']   # the wick that swept sell-side
-        wick_high = kl[i]['h']   # the wick that swept buy-side
+    # For SWEEP_OB: use the stored wick low/high from detection
+    wick_low  = sig.get('wick_low')   # exact low of sweep candle
+    wick_high = sig.get('wick_high')  # exact high of sweep candle
 
     sl_p = structure_sl(sh, sl, i, sig['dir'], atr_a[i],
                         sig.get('swept'), ob_level,
