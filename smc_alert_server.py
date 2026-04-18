@@ -1246,37 +1246,123 @@ def build_signal_msg(sig, pair):
     is_buy = sig['dir'] == 'BUY'
     emojis = {'SWEEP_OB':'⚡','HTF_CONFLUENCE':'📊','CHOCH':'🔄','BOS':'📈'}
     e = emojis.get(sig['setup'], '📡')
+    setup = sig['setup']
+
+    # ── Setup-specific explanation (WHY we are taking this trade) ──
+    if setup == 'SWEEP_OB':
+        if is_buy:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                f"  1️⃣ Equal lows at <code>{fp(sig.get('swept', sig['price']))}</code> "
+                f"→ retail stop losses were sitting there\n"
+                f"  2️⃣ Price SWEPT below those lows (stop hunt) then closed back above\n"
+                f"  3️⃣ Last red candle before sweep = OB zone "
+                f"<code>{fp(sig['ob']['bot']) if sig.get('ob') else '—'}</code> – "
+                f"<code>{fp(sig['ob']['top']) if sig.get('ob') else '—'}</code>\n"
+                f"  4️⃣ Price is NOW retesting that OB = institutions defending\n"
+                f"  5️⃣ Enter here, SL below swept wick — tight risk"
+            )
+        else:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                f"  1️⃣ Equal highs at <code>{fp(sig.get('swept', sig['price']))}</code> "
+                f"→ retail stop losses sitting above\n"
+                f"  2️⃣ Price SWEPT above those highs (stop hunt) then closed back below\n"
+                f"  3️⃣ Last green candle before sweep = bearish OB zone\n"
+                f"  4️⃣ Price retesting that OB = institutions selling here\n"
+                f"  5️⃣ Enter here, SL above swept wick — tight risk"
+            )
+    elif setup == 'CHOCH':
+        if is_buy:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                "  1️⃣ Market was bearish (lower highs + lower lows)\n"
+                "  2️⃣ Price broke ABOVE last Lower High = CHoCH confirmed\n"
+                "  3️⃣ Structure shifted from bearish to bullish\n"
+                "  4️⃣ First entry on the new bullish structure\n"
+                "  5️⃣ Early reversal play — tight SL below last swing low"
+            )
+        else:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                "  1️⃣ Market was bullish (higher highs + higher lows)\n"
+                "  2️⃣ Price broke BELOW last Higher Low = CHoCH confirmed\n"
+                "  3️⃣ Structure shifted from bullish to bearish\n"
+                "  4️⃣ First entry on the new bearish structure\n"
+                "  5️⃣ Early reversal — tight SL above last swing high"
+            )
+    elif setup == 'HTF_CONFLUENCE':
+        bias = 'bullish' if is_buy else 'bearish'
+        basis = (
+            "📖 <b>Why this trade:</b>\n"
+            f"  1️⃣ Weekly EMA: {esc(sig.get('weekly','—'))} ← top-down bias\n"
+            f"  2️⃣ Daily EMA: {esc(sig.get('daily','—'))} ← confirms direction\n"
+            f"  3️⃣ 1h structure: {bias} ← all 3 timeframes aligned\n"
+            f"  4️⃣ EMA9 > EMA20 > EMA50 stack ({'bull' if is_buy else 'bear'}) on 1h\n"
+            f"  5️⃣ MACD momentum confirming — trend continuation entry"
+        )
+    elif setup == 'BOS':
+        if is_buy:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                "  1️⃣ Clean bullish structure: HH → HH → HH (higher highs)\n"
+                "  2️⃣ Price broke above last swing HIGH = BOS confirmed\n"
+                "  3️⃣ Volume spike confirms institutional buying\n"
+                "  4️⃣ EMA stack bullish + MACD positive\n"
+                "  5️⃣ Trend continuation — buy the break"
+            )
+        else:
+            basis = (
+                "📖 <b>Why this trade:</b>\n"
+                "  1️⃣ Clean bearish structure: LL → LL → LL (lower lows)\n"
+                "  2️⃣ Price broke below last swing LOW = BOS confirmed\n"
+                "  3️⃣ Volume spike confirms institutional selling\n"
+                "  4️⃣ EMA stack bearish + MACD negative\n"
+                "  5️⃣ Trend continuation — sell the break"
+            )
+    else:
+        basis = "📖 <b>Why this trade:</b>\n  SMC confluence setup detected"
+
+    # ── Exchange SL note ──
+    sl_note = (
+        "\n⚠️ <b>SL note:</b> Set SL on YOUR exchange price, not this exact level.\n"
+        "Different exchanges vary ±0.1-0.3%. Add small buffer if needed."
+    )
+
+    # ── TP levels ──
+    risk = abs(sig['price'] - sig['sl'])
+    tp3  = sig.get('tp3', sig['price'] + risk*3 if is_buy else sig['price'] - risk*3)
+    tp1  = sig['tp1']
+    tp2  = sig['tp']
+
     lines = [
         f"{'🟢' if is_buy else '🔴'} <b>{'STRONG ' if sig['score']>=9 else ''}{sig['dir']} — {pair['sym']}/USD</b>",
         f"{e} <b>Setup: {esc(sig['name'])}</b>",
-        '',
-        f"📌 <i>{TIPS.get(sig['setup'], 'SMC confluence setup.')}</i>",
-        '',
-        '💰 <b>Trade Levels</b>',
+        f"📊 Score: {sig['score']}/10  |  Confidence: {sig['conf']}%  |  R:R 1:{sig['rr']}",
+        "",
+        basis,
+        "",
+        "💰 <b>Trade Levels</b>",
         f"  Entry:  <code>{fp(sig['price'])}</code>",
-        f"  SL:     <code>{fp(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%)</i>",
-        f"  TP1:    <code>{fp(sig['tp1'])}</code>  <i>(1:2 — close 50%, move SL to BE)</i>",
-        f"  TP2:    <code>{fp(sig['tp'])}</code>   <i>(1:{sig['rr']} — close 30%)</i>",
-        f"  TP3:    <code>{fp(sig['tp3'])}</code>  <i>(1:3 — let runner go)</i>",
-        '',
-        f"📊 <b>Score: {sig['score']}/10  |  Confidence: {sig['conf']}%  |  R:R 1:{sig['rr']}</b>",
-        f"  Confluences: {esc(' · '.join(sig['tags']))}",
-        f"  Weekly: {esc(sig['weekly'])}  |  Daily: {esc(sig['daily'])}  |  RSI: {sig['rsi_val']}",
-    ]
-    if sig.get('ob'):
-        lines.append(f"  OB Zone: {fp(sig['ob']['bot'])} – {fp(sig['ob']['top'])}")
-    if sig.get('swept'):
-        lines.append(f"  Swept at: {fp(sig['swept'])}")
-    lines += [
-        '',
-        '📋 <b>Trade Management:</b>',
-        '  • At TP1 → close 50% of position',
-        '  • Move SL to breakeven (entry)',
-        '  • Let remaining run to TP2, then TP3',
-        '',
-        '⚠️ <i>Not financial advice. Always manage risk.</i>',
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
-        f"📡 <b>SMC Engine Pro v3</b>",
+        f"  SL:     <code>{fp(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%) — below swept wick</i>" if setup=='SWEEP_OB'
+            else f"  SL:     <code>{fp(sig['sl'])}</code>  <i>(-{sig['risk_pct']}%)</i>",
+        f"  TP1:    <code>{fp(tp1)}</code>  <i>(1:2 — close 50%, move SL to entry)</i>",
+        f"  TP2:    <code>{fp(tp2)}</code>   <i>(1:{sig['rr']} — close 30%)</i>",
+        f"  TP3:    <code>{fp(tp3)}</code>  <i>(1:3 — let runner go)</i>",
+        "",
+        "🔍 <b>Confluences:</b> " + esc(' · '.join(sig.get('tags', []))),
+        f"  Weekly: {esc(sig.get('weekly','—'))}  |  Daily: {esc(sig.get('daily','—'))}  |  RSI: {sig.get('rsi_val','—')}",
+        (f"  OB Zone: {fp(sig['ob']['bot'])} – {fp(sig['ob']['top'])}" if sig.get('ob') else ""),
+        (f"  Swept at: {fp(sig['swept'])}" if sig.get('swept') else ""),
+        sl_note,
+        "",
+        "📋 <b>Trade Management:</b>",
+        "  • Enter at market price or limit at OB zone" if setup=='SWEEP_OB' else "  • Enter at market or on retest",
+        "  • At TP1 → close 50%, move SL to breakeven",
+        "  • Let rest run to TP2, trail to TP3",
+        "",
+        "⚠️ <i>Not financial advice. Always manage risk.</i>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v3</b>",
     ]
     return '\n'.join(l for l in lines if l is not None)
 
