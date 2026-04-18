@@ -483,6 +483,500 @@ def weekly_learning_report():
 
 # ════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════
+# DEEP CHART LEARNING ENGINE
+# Re-analyzes chart AFTER every trade closes
+# Learns from actual price/volume/RSI conditions
+# ════════════════════════════════════════════════
+"""
+Deep Chart Learning Engine
+===========================
+After every trade closes (win or loss):
+1. Re-fetches the candles from that time period
+2. Re-analyzes ALL metrics at the exact entry bar
+3. Compares winning conditions vs losing conditions
+4. Finds patterns: "When RSI was 25-35 AND volume >1.5x AND London session → 72% WR"
+5. Adjusts thresholds based on REAL chart data, not just setup names
+"""
+
+DEEP_LEARN_FILE = os.environ.get('DEEP_LEARN_FILE', '/app/smc_deep_learning.json')
+CG = 'https://api.coingecko.com/api/v3'
+KR = 'https://api.kraken.com/0/public'
+
+# ── METRICS WE ANALYZE ON EVERY TRADE ────────────────────────────────
+# These are the exact conditions at the entry bar
+METRIC_KEYS = [
+    'rsi',           # RSI value at entry
+    'rsi_zone',      # oversold/neutral/overbought
+    'volume_ratio',  # volume / 20-bar average
+    'atr_ratio',     # current ATR / 20-bar ATR avg (chop measure)
+    'session',       # London / NY / Asian / Weekend
+    'weekly_bias',   # bullish / bearish / neutral
+    'daily_bias',    # bullish / bearish / neutral
+    'ema_aligned',   # True if EMA stack aligned with direction
+    'macd_positive', # True if MACD histogram positive (for buys)
+    'ob_quality',    # clean / messy (how well-defined OB was)
+    'sweep_size',    # wick size / ATR ratio
+    'bars_since_sweep', # how many bars since the sweep candle
+    'score',         # signal score at time of entry
+    'rr',            # risk:reward ratio
+    'setup',         # SWEEP_OB / CHOCH / BOS / HTF
+    'direction',     # BUY / SELL
+]
+
+def load_deep_db():
+    if Path(DEEP_LEARN_FILE).exists():
+        try:
+            with open(DEEP_LEARN_FILE) as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        'version': 1,
+        'created': datetime.now(timezone.utc).isoformat(),
+        'trades': [],           # full trade records with metrics
+        'patterns': {},         # discovered winning patterns
+        'thresholds': {         # learned optimal thresholds
+            'min_volume_ratio':  1.15,
+            'min_rsi_buy_max':   62,    # RSI must be below this for buys
+            'max_rsi_buy_min':   25,    # RSI must be above this for buys
+            'min_sweep_size':    0.28,  # min sweep wick / ATR
+            'max_bars_retest':   8,     # max bars after sweep to retest
+            'min_atr_ratio':     0.40,  # min ATR vs average (not choppy)
+            'min_score':         7.0,
+            'best_sessions':     ['London', 'New York'],
+            'avoid_weekly':      ['bearish'],  # avoid buying in these
+        },
+        'condition_stats': {},  # win rate per condition value
+        'insights': [],         # human-readable insights discovered
+    }
+
+def save_deep_db(db):
+    try:
+        with open(DEEP_LEARN_FILE, 'w') as f:
+            json.dump(db, f, indent=2)
+    except Exception as e:
+        print(f"Deep DB save error: {e}")
+
+# ── FETCH HISTORICAL CANDLES FOR RE-ANALYSIS ─────────────────────────
+def fetch_candles_at_time(pair_cg, pair_kr, timestamp, limit=100):
+    """Fetch candles around a specific timestamp for post-trade analysis"""
+    try:
+        r = requests.get(f'{KR}/OHLC',
+            params={'pair': pair_kr, 'interval': 60, 'since': int(timestamp)-3600*limit},
+            timeout=15)
+        d = r.json()
+        if not d.get('error'):
+            key = next((k for k in d['result'] if k != 'last'), None)
+            if key:
+                raw = d['result'][key]
+                return [{'t': int(k[0]), 'o':float(k[1]),'h':float(k[2]),
+                         'l':float(k[3]),'c':float(k[4]),'v':float(k[6])}
+                        for k in raw[-limit:]]
+    except: pass
+    try:
+        r = requests.get(f'{CG}/coins/{pair_cg}/ohlc',
+            params={'vs_currency':'usd','days':7}, timeout=15)
+        raw = r.json()
+        if isinstance(raw, list):
+            return [{'t':int(k[0]/1000),'o':float(k[1]),'h':float(k[2]),
+                     'l':float(k[3]),'c':float(k[4]),'v':50.0}
+                    for k in raw[-limit:]]
+    except: pass
+    return []
+
+# ── INDICATORS ────────────────────────────────────────────────────────
+def _ema(c, p):
+    if len(c) < p: return [None]*len(c)
+    k=2/(p+1); r=[None]*(p-1); s=sum(c[:p])/p; r.append(s); pv=s
+    for i in range(p,len(c)): pv=c[i]*k+pv*(1-k); r.append(pv)
+    return r
+
+def _rsi(c, p=14):
+    if len(c)<p+1: return [None]*len(c)
+    r=[None]*p; g=l=0.0
+    for i in range(1,p+1):
+        d=c[i]-c[i-1]
+        if d>0: g+=d
+        else: l+=abs(d)
+    ag,al=g/p,l/p; r.append(100 if al==0 else 100-100/(1+ag/al))
+    for i in range(p+1,len(c)):
+        d=c[i]-c[i-1]; ag=(ag*(p-1)+(d if d>0 else 0))/p; al=(al*(p-1)+(abs(d) if d<0 else 0))/p
+        r.append(100 if al==0 else 100-100/(1+ag/al))
+    return r
+
+def _macd_hist(c):
+    e12=_ema(c,12); e26=_ema(c,26)
+    ln=[e12[i]-e26[i] if e12[i] and e26[i] else None for i in range(len(c))]
+    vl=[v for v in ln if v]
+    if len(vl)<9: return [None]*len(c)
+    sr=_ema(vl,9); sg=[None]*len(c); si=0
+    for i in range(len(c)):
+        if ln[i] is not None: sg[i]=sr[si] if si<len(sr) else None; si+=1
+    return [ln[i]-sg[i] if ln[i] and sg[i] else None for i in range(len(c))]
+
+def _atr(kl, p=14):
+    tr=[None]+[max(kl[i]['h']-kl[i]['l'],abs(kl[i]['h']-kl[i-1]['c']),
+               abs(kl[i]['l']-kl[i-1]['c'])) for i in range(1,len(kl))]
+    if len(tr)<p+1: return [None]*len(kl)
+    r=[None]*p; s=sum(tr[1:p+1])/p; r.append(s); pv=s
+    for i in range(p+1,len(tr)): pv=(pv*(p-1)+tr[i])/p; r.append(pv)
+    return r
+
+def _vol_avg(v, p=20):
+    r=[None]*p
+    for i in range(p,len(v)): r.append(sum(v[i-p:i])/p)
+    return r
+
+# ── DEEP METRIC EXTRACTION ────────────────────────────────────────────
+def extract_metrics_from_chart(kl, trade):
+    """
+    Re-analyze ALL chart conditions at the exact entry bar.
+    This is what the engine ACTUALLY saw when it fired the signal.
+    Returns a dict of all measurable conditions.
+    """
+    if not kl or len(kl) < 30:
+        return None
+
+    i = len(kl) - 1
+    closes = [k['c'] for k in kl]
+    vols   = [k['v'] for k in kl]
+    price  = closes[i]
+
+    rsi_a  = _rsi(closes)
+    e20_a  = _ema(closes, 20)
+    e50_a  = _ema(closes, 50)
+    e9_a   = _ema(closes, 9)
+    ht_a   = _macd_hist(closes)
+    atr_a  = _atr(kl)
+    va_a   = _vol_avg(vols)
+
+    if not all([rsi_a[i], e20_a[i], e50_a[i], atr_a[i], va_a[i]]):
+        return None
+
+    is_buy      = trade['dir'] == 'BUY'
+    rsi_val     = round(rsi_a[i], 1)
+    vol_ratio   = round(kl[i]['v'] / va_a[i], 2) if va_a[i] else 0
+    atr_ratio   = round(atr_a[i] / (sum(a for a in atr_a[max(0,i-20):i] if a) /
+                        max(1, len([a for a in atr_a[max(0,i-20):i] if a]))), 2) \
+                  if atr_a[i] else 0
+
+    # EMA alignment
+    ema_aligned = (price > e20_a[i] > e50_a[i]) if is_buy else (price < e20_a[i] < e50_a[i])
+    ema_stack   = (e9_a[i] > e20_a[i] > e50_a[i]) if (is_buy and e9_a[i]) else \
+                  (e9_a[i] < e20_a[i] < e50_a[i]) if (not is_buy and e9_a[i]) else False
+
+    # MACD confirmation
+    macd_ok = (ht_a[i] > 0) if is_buy else (ht_a[i] < 0) if ht_a[i] else False
+
+    # RSI zone
+    rsi_zone = ('oversold' if rsi_val < 35 else
+                'neutral'  if rsi_val < 65 else 'overbought')
+
+    # Candle quality at entry
+    body    = abs(kl[i]['c'] - kl[i]['o'])
+    rng     = kl[i]['h'] - kl[i]['l'] + 1e-10
+    body_pct = round(body/rng*100, 1)
+
+    # Sweep-specific metrics
+    sweep_size   = 0.0
+    bars_retest  = 0
+    ob_quality   = 'none'
+
+    if trade.get('setup') == 'SWEEP_OB':
+        swept_lvl = trade.get('swept_price', price)
+        if swept_lvl and atr_a[i]:
+            # How big was the sweep wick relative to ATR?
+            sweep_wick = abs(swept_lvl - min(kl[max(0,i-5):i+1], key=lambda x:x['l'])['l'])
+            sweep_size = round(sweep_wick / atr_a[i], 2)
+        # How many bars ago was the actual sweep?
+        bars_retest = trade.get('bars_since_sweep', 0)
+        # OB quality: how clean was the OB candle
+        ob_top = trade.get('ob_top', 0)
+        ob_bot = trade.get('ob_bot', 0)
+        if ob_top and ob_bot and atr_a[i]:
+            ob_size = ob_top - ob_bot
+            ob_quality = 'clean' if ob_size > atr_a[i]*0.3 else 'small'
+
+    # Recent trend strength (bearish or bullish pressure)
+    recent6 = kl[max(0,i-6):i+1]
+    bear_candles = sum(1 for x in recent6 if x['c'] < x['o'])
+    bull_candles = len(recent6) - bear_candles
+    trend_pressure = 'strong_bear' if bear_candles >= 5 else \
+                     'strong_bull' if bull_candles >= 5 else 'mixed'
+
+    # Consecutive same-direction candles
+    consec = 0
+    for j in range(i, max(0, i-8), -1):
+        if is_buy and kl[j]['c'] < kl[j]['o']: consec += 1
+        elif not is_buy and kl[j]['c'] > kl[j]['o']: consec += 1
+        else: break
+
+    return {
+        'rsi':              rsi_val,
+        'rsi_zone':         rsi_zone,
+        'volume_ratio':     vol_ratio,
+        'atr_ratio':        atr_ratio,
+        'ema_aligned':      ema_aligned,
+        'ema_stack':        ema_stack,
+        'macd_ok':          macd_ok,
+        'body_pct':         body_pct,
+        'sweep_size':       sweep_size,
+        'bars_retest':      bars_retest,
+        'ob_quality':       ob_quality,
+        'trend_pressure':   trend_pressure,
+        'consec_against':   consec,
+        'session':          trade.get('session', 'unknown'),
+        'weekly_bias':      trade.get('weekly', 'neutral'),
+        'daily_bias':       trade.get('daily', 'neutral'),
+        'score':            trade.get('score', 0),
+        'rr':               trade.get('rr', 0),
+        'setup':            trade.get('setup', ''),
+        'direction':        trade.get('dir', ''),
+    }
+
+# ── LEARN FROM CLOSED TRADE ───────────────────────────────────────────
+def learn_from_trade(trade, result, kl=None):
+    """
+    Called when a trade closes.
+    Extracts chart metrics and stores them.
+    Analyzes patterns after every 10 trades.
+    """
+    db = load_deep_db()
+
+    # Extract metrics from chart
+    metrics = None
+    if kl:
+        metrics = extract_metrics_from_chart(kl, trade)
+
+    record = {
+        'id':       trade.get('id', f"{trade['sym']}_{int(time.time())}"),
+        'sym':      trade['sym'],
+        'setup':    trade.get('setup', ''),
+        'dir':      trade['dir'],
+        'result':   result,
+        'pnl':      trade.get('pnl', 0),
+        'time':     datetime.now(timezone.utc).isoformat(),
+        'metrics':  metrics,
+        'tags':     trade.get('tags', []),
+    }
+    db['trades'].append(record)
+
+    # Update condition stats
+    if metrics:
+        _update_condition_stats(db, metrics, result)
+
+    # Analyze patterns every 10 trades
+    total = len([t for t in db['trades'] if t.get('result')])
+    if total >= 10 and total % 5 == 0:
+        insights = _find_patterns(db)
+        if insights:
+            db['insights'].extend(insights)
+            # Apply threshold updates
+            _update_thresholds(db)
+
+    save_deep_db(db)
+    return record
+
+def _update_condition_stats(db, metrics, result):
+    """Track win rate for each condition value"""
+    is_win = result == 'win'
+
+    conditions_to_track = {
+        'session':       metrics.get('session'),
+        'weekly_bias':   metrics.get('weekly_bias'),
+        'rsi_zone':      metrics.get('rsi_zone'),
+        'ema_aligned':   str(metrics.get('ema_aligned')),
+        'macd_ok':       str(metrics.get('macd_ok')),
+        'ob_quality':    metrics.get('ob_quality'),
+        'trend_pressure':metrics.get('trend_pressure'),
+        'high_volume':   str(metrics.get('volume_ratio', 0) >= 1.5),
+        'very_high_vol': str(metrics.get('volume_ratio', 0) >= 2.0),
+        'clean_rsi_buy': str(metrics.get('rsi', 50) < 45 and metrics.get('direction')=='BUY'),
+        'no_trend_press':str(metrics.get('trend_pressure') == 'mixed'),
+        'low_consec':    str(metrics.get('consec_against', 0) <= 2),
+    }
+    for key, val in conditions_to_track.items():
+        if val is None: continue
+        stat_key = f"{key}:{val}"
+        if stat_key not in db['condition_stats']:
+            db['condition_stats'][stat_key] = {'w':0,'l':0,'be':0,'total':0}
+        s = db['condition_stats'][stat_key]
+        s['total'] += 1
+        if result == 'win':   s['w'] += 1
+        elif result == 'loss': s['l'] += 1
+        else:                  s['be'] += 1
+
+def _find_patterns(db):
+    """Find conditions that predict wins vs losses"""
+    insights = []
+    stats = db['condition_stats']
+    thresholds = db['thresholds']
+
+    for key, s in stats.items():
+        if s['total'] < 5: continue
+        wr = s['w'] / s['total']
+
+        # High win rate condition
+        if wr >= 0.65 and s['total'] >= 5:
+            insights.append({
+                'type': 'positive',
+                'condition': key,
+                'wr': round(wr*100),
+                'trades': s['total'],
+                'message': f"✅ When {key} → WR {round(wr*100)}% ({s['total']} trades)"
+            })
+
+        # Low win rate condition — this is a WARNING
+        elif wr <= 0.30 and s['total'] >= 5:
+            insights.append({
+                'type': 'negative',
+                'condition': key,
+                'wr': round(wr*100),
+                'trades': s['total'],
+                'message': f"❌ When {key} → WR only {round(wr*100)}% — AVOID ({s['total']} trades)"
+            })
+
+    return insights[-10:] if insights else []  # keep latest 10
+
+def _update_thresholds(db):
+    """
+    Auto-adjust detection thresholds based on real performance.
+    This is where the engine actually gets smarter.
+    """
+    stats  = db['condition_stats']
+    thresh = db['thresholds']
+    changes = []
+
+    # Session learning
+    for sess in ['London', 'New York', 'Asian', 'Weekend']:
+        key = f"session:{sess}"
+        if key in stats and stats[key]['total'] >= 5:
+            wr = stats[key]['w'] / stats[key]['total']
+            if wr < 0.30 and sess in thresh['best_sessions']:
+                thresh['best_sessions'].remove(sess)
+                changes.append(f"Removed {sess} from best sessions (WR:{round(wr*100)}%)")
+            elif wr >= 0.55 and sess not in thresh['best_sessions']:
+                thresh['best_sessions'].append(sess)
+                changes.append(f"Added {sess} to best sessions (WR:{round(wr*100)}%)")
+
+    # Weekly bias learning
+    for bias in ['bullish', 'neutral', 'bearish']:
+        key = f"weekly_bias:{bias}"
+        if key in stats and stats[key]['total'] >= 5:
+            wr = stats[key]['w'] / stats[key]['total']
+            if wr < 0.30 and bias not in thresh['avoid_weekly']:
+                thresh['avoid_weekly'].append(bias)
+                changes.append(f"Added weekly:{bias} to avoid list (WR:{round(wr*100)}%)")
+            elif wr >= 0.55 and bias in thresh['avoid_weekly']:
+                thresh['avoid_weekly'].remove(bias)
+                changes.append(f"Removed weekly:{bias} from avoid list (WR:{round(wr*100)}%)")
+
+    # Volume threshold
+    hi_vol = stats.get('high_volume:True', {'w':0,'total':0})
+    lo_vol_key = 'high_volume:False'
+    lo_vol = stats.get(lo_vol_key, {'w':0,'total':0})
+    if hi_vol['total'] >= 5 and lo_vol['total'] >= 5:
+        wr_hi = hi_vol['w']/hi_vol['total']
+        wr_lo = lo_vol['w']/lo_vol['total']
+        if wr_hi > wr_lo + 0.15:
+            thresh['min_volume_ratio'] = max(1.3, thresh['min_volume_ratio'])
+            changes.append(f"Raised min_volume_ratio (high vol WR:{round(wr_hi*100)}% vs low:{round(wr_lo*100)}%)")
+        elif wr_hi < wr_lo:
+            thresh['min_volume_ratio'] = max(1.0, thresh['min_volume_ratio'] - 0.05)
+            changes.append(f"Lowered min_volume_ratio")
+
+    # Trend pressure
+    no_press = stats.get('no_trend_press:True', {'w':0,'total':0})
+    press    = stats.get('no_trend_press:False', {'w':0,'total':0})
+    if no_press['total'] >= 5 and press['total'] >= 5:
+        wr_np = no_press['w']/no_press['total']
+        wr_p  = press['w']/press['total']
+        if wr_np > wr_p + 0.15:
+            # Mixed trend is better — relax the filter
+            changes.append(f"Confirmed: no trend pressure better (WR:{round(wr_np*100)}% vs {round(wr_p*100)}%)")
+        elif wr_p > wr_np + 0.15:
+            changes.append(f"Trend pressure actually helps! WR:{round(wr_p*100)}%")
+
+    if changes:
+        db['insights'].append({
+            'type': 'threshold_update',
+            'time': datetime.now(timezone.utc).isoformat(),
+            'changes': changes
+        })
+
+    db['thresholds'] = thresh
+
+# ── DEEP LEARNING REPORT ──────────────────────────────────────────────
+def deep_learning_report():
+    db = load_deep_db()
+    trades = [t for t in db['trades'] if t.get('result')]
+    if not trades:
+        return "🧠 No completed trades yet for deep analysis."
+
+    wins   = [t for t in trades if t['result']=='win']
+    losses = [t for t in trades if t['result']=='loss']
+    wr     = len(wins)/len(trades)*100
+
+    lines = [
+        "🧠 <b>Deep Chart Learning Report</b>",
+        f"Analyzed {len(trades)} trades from real chart data\n",
+        f"✅ Wins: {len(wins)} | ❌ Losses: {len(losses)} | WR: {wr:.1f}%\n",
+        "<b>📊 What the engine learned:</b>",
+    ]
+
+    # Show top positive patterns
+    pos = [i for i in db['insights'] if i.get('type')=='positive']
+    neg = [i for i in db['insights'] if i.get('type')=='negative']
+
+    if pos:
+        lines.append("\n✅ <b>Conditions that WIN:</b>")
+        for p in sorted(pos, key=lambda x:-x['wr'])[:5]:
+            lines.append(f"  {p['message']}")
+
+    if neg:
+        lines.append("\n❌ <b>Conditions to AVOID:</b>")
+        for n in sorted(neg, key=lambda x:x['wr'])[:5]:
+            lines.append(f"  {n['message']}")
+
+    # Current thresholds
+    t = db['thresholds']
+    lines += [
+        "\n<b>⚙️ Learned Thresholds:</b>",
+        f"  Min volume ratio: {t['min_volume_ratio']}x avg",
+        f"  Best sessions: {', '.join(t['best_sessions'])}",
+        f"  Avoid weekly: {', '.join(t['avoid_weekly']) or 'none'}",
+        f"  Min score: {t['min_score']}",
+    ]
+
+    # Win/loss metric comparison
+    if len(wins) >= 3 and len(losses) >= 3:
+        def avg_metric(trade_list, key):
+            vals = [t['metrics'][key] for t in trade_list
+                    if t.get('metrics') and t['metrics'].get(key) is not None
+                    and isinstance(t['metrics'][key], (int, float))]
+            return round(sum(vals)/len(vals), 2) if vals else None
+
+        lines.append("\n<b>📈 Average metrics — Wins vs Losses:</b>")
+        for metric, label in [('rsi','RSI'),('volume_ratio','Volume ratio'),
+                               ('score','Score'),('rr','R:R')]:
+            w_avg = avg_metric(wins, metric)
+            l_avg = avg_metric(losses, metric)
+            if w_avg and l_avg:
+                diff = '↑ Better' if (metric in ('volume_ratio','score','rr') and w_avg>l_avg) or \
+                                      (metric=='rsi' and abs(w_avg-50)<abs(l_avg-50)) else '↓ Worse'
+                lines.append(f"  {label}: Wins={w_avg} | Losses={l_avg} {diff}")
+
+    lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+    lines.append("📡 <b>SMC Deep Learning Engine</b>")
+    return '\n'.join(lines)
+
+def get_learned_thresholds():
+    """Returns current learned thresholds for use in signal detection"""
+    return load_deep_db()['thresholds']
+
+
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1478,6 +1972,14 @@ def check_prices():
                     lid = trade.get('learn_id')
                     if lid: close_trade(lid,'win',price)
                     journal_close_trade(sym,'win',price)
+                    # 🧠 Deep chart re-analysis
+                    try:
+                        pair_deep = next(p for p in PAIRS if p['sym']==sym)
+                        kl_deep   = fetch_candles(pair_deep, limit=100)
+                        if kl_deep:
+                            learn_from_trade({**trade,'sym':sym,'pnl':pnl}, 'win', kl_deep)
+                    except Exception as _e:
+                        log.debug(f"Deep learn WIN {sym}: {_e}")
                     state['stats']['wins'] = state['stats'].get('wins',0)+1
                     _upd_stat(trade.get('setup','?'),'w')
                     log.info(f"  ✅ WIN: {sym} +{pnl}%")
@@ -1514,6 +2016,14 @@ def check_prices():
                 lid = trade.get('learn_id')
                 if lid: close_trade(lid,'loss',price)
                 journal_close_trade(sym,'loss',price)
+                # 🧠 Deep chart re-analysis on LOSS
+                try:
+                    _pair_d = next(p for p in PAIRS if p['sym']==sym)
+                    _kl_d   = fetch_candles(_pair_d, limit=100)
+                    if _kl_d:
+                        learn_from_trade({**trade,'sym':sym,'pnl':-pnl,'id':f"{sym}_{int(time.time())}"}, 'loss', _kl_d)
+                except Exception as _le:
+                    log.debug(f"Deep learn LOSS {sym}: {_le}")
                 state['stats']['losses'] = state['stats'].get('losses',0)+1
                 _upd_stat(trade.get('setup','?'),'l')
                 log.info(f"  ❌ LOSS: {sym} -{pnl}%")
@@ -1680,6 +2190,7 @@ def run_scan():
                     learn_id = log_signal(sig, pair, session_now)
                     trade_entry = {
                         'dir':        sig['dir'],
+                        'id':         f"{pair['sym']}_{int(time.time())}",
                         'setup':      sig['setup'],
                         'setup_name': sig['name'],
                         'entry':      sig['price'],
@@ -1792,6 +2303,8 @@ def main():
                             send_tg(journal_msg + sess_msg)
                         elif txt in ('/learn','/learning','/ml'):
                             send_tg(performance_report())
+                        elif txt in ('/deep','/deeplearn','/analysis'):
+                            send_tg(deep_learning_report())
                         elif txt == '/weights':
                             db = load_db()
                             w_d = db['weights']
@@ -1822,7 +2335,8 @@ def main():
                             send_tg(
                                 "📡 <b>SMC Bot Commands</b>\n\n"
                                 "/stats   — performance report\n"
-                                "/learn   — self-learning report\n"
+                                "/learn   — learning weights report\n"
+                                "/deep    — deep chart analysis report\n"
                                 "/weights — learned weights\n"
                                 "/weekly  — weekly summary\n"
                                 "/open    — open trades\n"
