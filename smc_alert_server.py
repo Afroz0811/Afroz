@@ -18,7 +18,8 @@ Environment variables (set in Railway Variables tab):
   PORT              = HTTP port (Railway sets this automatically)
 """
 
-import os, time, logging, threading, json
+import os, time, logging, threading, json, csv
+from pathlib import Path
 import requests
 import numpy as np
 from datetime import datetime, timezone
@@ -53,6 +54,137 @@ PAIRS = [
 ]
 
 KR = 'https://api.kraken.com/0/public'
+
+# ── TRADING JOURNAL ────────────────────────────
+JOURNAL_FILE = os.environ.get('JOURNAL_FILE', '/app/smc_journal.json')
+
+def load_journal():
+    if Path(JOURNAL_FILE).exists():
+        try:
+            with open(JOURNAL_FILE) as f: return json.load(f)
+        except: pass
+    return {'trades':[],'open':{},'signals':[],'stats':{},'created':datetime.now(timezone.utc).isoformat()}
+
+def save_journal(j):
+    try:
+        with open(JOURNAL_FILE,'w') as f: json.dump(j,f,indent=2)
+    except Exception as e:
+        log.debug(f"Journal save error: {e}")
+
+def journal_log_signal(sig, pair):
+    try:
+        j = load_journal()
+        entry = {
+            'id':         f"{pair['sym']}_{int(time.time())}",
+            'sym':        pair['sym'],
+            'setup':      sig['setup'],
+            'setup_name': sig['name'],
+            'dir':        sig['dir'],
+            'score':      sig['score'],
+            'entry':      sig['price'],
+            'sl':         sig['sl'],
+            'tp1':        sig['tp1'],
+            'tp2':        sig['tp'],
+            'tp3':        sig['tp3'],
+            'rr':         sig['rr'],
+            'risk_pct':   sig['risk_pct'],
+            'tags':       sig['tags'],
+            'weekly':     sig.get('weekly','—'),
+            'rsi':        sig.get('rsi_val',0),
+            'time':       datetime.now(timezone.utc).isoformat(),
+            'status':     'open',
+            'exit_price': None,
+            'exit_time':  None,
+            'pnl':        None,
+        }
+        j['signals'].append(entry)
+        j['open'][pair['sym']] = entry['id']
+        save_journal(j)
+        log.info(f"  📓 Journal: logged {pair['sym']} {sig['dir']} {sig['setup']}")
+    except Exception as e:
+        log.debug(f"Journal log error: {e}")
+
+def journal_close_trade(sym, result, exit_price):
+    try:
+        j = load_journal()
+        trade_id = j['open'].get(sym)
+        if not trade_id: return
+        sig = next((s for s in j['signals'] if s['id']==trade_id), None)
+        if not sig: return
+        is_buy = sig['dir']=='BUY'
+        pnl = ((exit_price-sig['entry'])/sig['entry']*100) if is_buy else ((sig['entry']-exit_price)/sig['entry']*100)
+        sig.update({'status':result,'exit_price':exit_price,
+                    'exit_time':datetime.now(timezone.utc).isoformat(),'pnl':round(pnl,3)})
+        j['trades'].append(sig)
+        del j['open'][sym]
+        # Update stats
+        s = j['stats'].setdefault(sig['setup'],{'wins':0,'losses':0,'be':0,'total':0,'total_pnl':0})
+        s['total']+=1; s['total_pnl']=round(s['total_pnl']+pnl,3)
+        if result=='win': s['wins']+=1
+        elif result=='loss': s['losses']+=1
+        else: s['be']+=1
+        save_journal(j)
+    except Exception as e:
+        log.debug(f"Journal close error: {e}")
+
+def journal_stats_report():
+    try:
+        j = load_journal()
+        trades=[t for t in j['signals'] if t['status']!='open']
+        if not trades: return "📊 No completed trades yet."
+        wins=[t for t in trades if t['status']=='win']
+        losses=[t for t in trades if t['status']=='loss']
+        be=[t for t in trades if t['status']=='be']
+        total=len(trades); wr=len(wins)/total*100 if total else 0
+        total_pnl=sum(t.get('pnl',0) or 0 for t in trades)
+        avg_win=sum(t.get('pnl',0) or 0 for t in wins)/len(wins) if wins else 0
+        avg_loss=sum(abs(t.get('pnl',0) or 0) for t in losses)/len(losses) if losses else 0
+        pf=(len(wins)*avg_win)/(len(losses)*avg_loss) if losses and avg_loss>0 else 0
+        lines=[
+            "📊 <b>SMC Journal — Performance Report</b>","",
+            f"📈 Total trades:   {total}",
+            f"✅ Wins:           {len(wins)} ({wr:.1f}%)",
+            f"❌ Losses:         {len(losses)}",
+            f"➡️ Breakeven:      {len(be)}",
+            f"💰 Total P&amp;L:  {total_pnl:+.2f}%",
+            f"📐 Profit Factor:  {pf:.2f}",
+            f"📊 Avg Win:        +{avg_win:.2f}%",
+            f"📊 Avg Loss:       -{avg_loss:.2f}%","",
+            "<b>Per Setup:</b>",
+        ]
+        for setup,s in j['stats'].items():
+            if not s['total']: continue
+            wr_s=s['wins']/s['total']*100
+            e={'SWEEP_OB':'⚡','HTF_CONFLUENCE':'📊','CHOCH':'🔄','BOS':'📈'}.get(setup,'📡')
+            lines.append(f"  {e} {setup}: {s['total']} | WR:{wr_s:.0f}% | PnL:{s['total_pnl']:+.1f}%")
+        if trades:
+            best=max(trades,key=lambda t:t.get('pnl',0) or 0)
+            worst=min(trades,key=lambda t:t.get('pnl',0) or 0)
+            lines+=["",
+                f"🏆 Best:  {best['sym']} +{best.get('pnl',0):.2f}% ({best['setup']})",
+                f"💔 Worst: {worst['sym']} {worst.get('pnl',0):.2f}% ({worst['setup']})"]
+        if j['open']:
+            lines.append(f"\n🔓 Open: {', '.join(j['open'].keys())}")
+        lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3")
+        return '\n'.join(lines)
+    except Exception as e:
+        return f"Journal error: {e}"
+
+def check_circuit_breaker():
+    """Pause trading after 3 consecutive losses"""
+    try:
+        j = load_journal()
+        recent=[t for t in j['signals'] if t['status'] in ('win','loss')][-3:]
+        if len(recent)<3: return False
+        if all(t['status']=='loss' for t in recent):
+            last_time=datetime.fromisoformat(recent[-1]['time']).timestamp()
+            hours_since=(time.time()-last_time)/3600
+            if hours_since<4:
+                log.warning(f"⚠️ Circuit breaker: 3 losses in a row — pausing {4-hours_since:.1f}h")
+                return True
+    except: pass
+    return False
+
 CG = 'https://api.coingecko.com/api/v3'
 
 # ── SERVER STATE ───────────────────────────────
@@ -61,15 +193,23 @@ state = {
     'last_scan':    'Never',
     'scans_done':   0,
     'alerts_sent':  0,
-    'open_trades':  {},   # sym -> {setup, dir, entry, sl, tp, tp1, score, time}
-    'last_signals': {},   # sym -> {dir, setup, score, time}
+    'open_trades':  {},   # sym -> trade dict
+    'last_signals': {},   # sym -> last signal info
+    'stats': {            # live win/loss tracker
+        'wins':    0,
+        'losses':  0,
+        'be':      0,
+        'by_setup': {}
+    }
 }
 
 # ── HEALTH SERVER ──────────────────────────────
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
+        w=state['stats'].get('wins',0); l=state['stats'].get('losses',0)
+        b=state['stats'].get('be',0); tot=w+l+b
         open_t = '\n'.join(
-            f"  {sym}: {v['dir']} {v['setup']} entry={v['entry']:.4f} sl={v['sl']:.4f}"
+            f"  {sym}: {v['dir']} {v.get('setup','?')} entry={v['entry']:.4f}"
             for sym, v in state['open_trades'].items()
         ) or '  (none)'
         body = (
@@ -79,11 +219,12 @@ class Health(BaseHTTPRequestHandler):
             f"Last scan:    {state['last_scan']}\n"
             f"Scans done:   {state['scans_done']}\n"
             f"Alerts sent:  {state['alerts_sent']}\n"
-            f"Open trades:  {len(state['open_trades'])}\n"
-            f"Min score:    {MIN_SCORE}/10\n"
-            f"Scan every:   {SCAN_EVERY}m\n"
-            f"Cooldown:     {COOLDOWN_M}m\n"
-            f"\nOpen trades:\n{open_t}\n"
+            f"\nWIN/LOSS TRACKER\n"
+            f"Wins:         {w}\n"
+            f"Losses:       {l}\n"
+            f"Breakeven:    {b}\n"
+            f"Win rate:     {round(w/tot*100) if tot else 0}%\n"
+            f"\nOpen trades: {len(state['open_trades'])}\n{open_t}\n"
             f"\nTime (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n"
         ).encode()
         self.send_response(200)
@@ -417,6 +558,46 @@ def compute(kl, pair, kl_btc=None):
             log.debug(f"{pair['sym']}: blocked by BTC gate ({sig['dir']})")
             return None
 
+    # ── BONUS SCORE BOOSTERS (don't block, just raise quality score) ──
+    # Booster 1: RSI Divergence — price/RSI mismatch = hidden strength (+1.5)
+    def _rsi_div(direction):
+        lb = 15
+        if i < lb+5: return False
+        if direction == 'BUY':
+            rl = [(ix,p) for ix,p in sl if i-lb < ix < i][-3:]
+            if len(rl)>=2 and rsi_a[rl[-2][0]] and rsi_a[rl[-1][0]]:
+                if rl[-1][1] < rl[-2][1] and rsi_a[rl[-1][0]] > rsi_a[rl[-2][0]]: return True
+        else:
+            rh = [(ix,p) for ix,p in sh if i-lb < ix < i][-3:]
+            if len(rh)>=2 and rsi_a[rh[-2][0]] and rsi_a[rh[-1][0]]:
+                if rh[-1][1] > rh[-2][1] and rsi_a[rh[-1][0]] < rsi_a[rh[-2][0]]: return True
+        return False
+
+    # Booster 2: Fibonacci zone — price at 38.2/50/61.8% retracement (+0.5)
+    def _fib_zone():
+        rh_f = [(ix,p) for ix,p in sh if ix < i][-3:]
+        rl_f = [(ix,p) for ix,p in sl if ix < i][-3:]
+        if not rh_f or not rl_f: return False
+        hi = rh_f[-1][1]; lo = rl_f[-1][1]; rng = hi - lo
+        if rng <= 0: return False
+        return any(abs(price - (hi - rng*f)) <= rng*0.025 for f in [0.382, 0.5, 0.618])
+
+    # Booster 3: VWAP alignment — price on right side of VWAP (+0.5)
+    def _vwap_ok(direction):
+        win = kl[max(0, i-20):i+1]
+        tv = sum(k['v'] for k in win)
+        if not tv: return False
+        vwap = sum(((k['h']+k['l']+k['c'])/3) * k['v'] for k in win) / tv
+        return (direction == 'BUY' and price >= vwap) or (direction == 'SELL' and price <= vwap)
+
+    extra_tags = []; bonus = 0.0
+    if _rsi_div(sig['dir']): bonus += 1.5; extra_tags.append('RSI_Div✓')
+    if _fib_zone():           bonus += 0.5; extra_tags.append('Fib✓')
+    if _vwap_ok(sig['dir']): bonus += 0.5; extra_tags.append('VWAP✓')
+    sig = dict(sig)
+    sig['score']  = min(10, round(sig['score'] + bonus, 1))
+    sig['tags']   = list(sig.get('tags', [])) + extra_tags
+
     is_buy = sig['dir'] == 'BUY'
 
     # IMPROVEMENT 4: Structure-based SL
@@ -588,16 +769,56 @@ def send_tg(msg):
 
 # ── PRICE CHECK (for BE manager) ───────────────
 def check_prices():
-    """Lightweight price check every minute for BE management"""
+    """Price check every minute: BE management + win/loss auto-detection"""
     for sym, trade in list(state['open_trades'].items()):
-        if trade.get('be_triggered'): continue
         try:
             pair = next(p for p in PAIRS if p['sym'] == sym)
             r = requests.get(f'{CG}/simple/price',
                 params={'ids': pair['cg'], 'vs_currencies': 'usd'},
                 timeout=8)
             price = r.json()[pair['cg']]['usd']
-            if price: check_breakeven(sym, price)
+            if not price: continue
+
+            is_buy = trade['dir'] == 'BUY'
+            sl_p   = trade['sl']
+            tp_p   = trade['tp']
+            tp1_p  = trade['tp1']
+
+            # ── BREAKEVEN: TP1 hit → alert to move SL ──
+            if not trade.get('be_triggered') and tp1_p:
+                tp1_hit = (is_buy and price >= tp1_p) or (not is_buy and price <= tp1_p)
+                if tp1_hit:
+                    trade['be_triggered'] = True
+                    check_breakeven(sym, price)
+
+            # ── WIN: TP2 hit ──
+            tp_hit = (is_buy and price >= tp_p) or (not is_buy and price <= tp_p)
+            if tp_hit:
+                pnl = round(abs(tp_p - trade['entry']) / trade['entry'] * 100, 2)
+                msg = build_result_msg(sym, 'WIN', pnl, trade)
+                send_tg(msg)
+                journal_close_trade(sym, 'win', tp_p)
+                state['stats']['wins'] = state['stats'].get('wins', 0) + 1
+                state['stats'].setdefault('by_setup', {}).setdefault(trade.get('setup','?'), {'w':0,'l':0,'be':0})
+                state['stats']['by_setup'][trade.get('setup','?')]['w'] += 1
+                log.info(f"  ✅ WIN: {sym} +{pnl}% → TG sent")
+                del state['open_trades'][sym]
+                continue
+
+            # ── LOSS: SL hit ──
+            sl_hit = (is_buy and price <= sl_p) or (not is_buy and price >= sl_p)
+            if sl_hit:
+                pnl = round(abs(sl_p - trade['entry']) / trade['entry'] * 100, 2)
+                msg = build_result_msg(sym, 'LOSS', -pnl, trade)
+                send_tg(msg)
+                journal_close_trade(sym, 'loss', sl_p)
+                state['stats']['losses'] = state['stats'].get('losses', 0) + 1
+                state['stats'].setdefault('by_setup', {}).setdefault(trade.get('setup','?'), {'w':0,'l':0,'be':0})
+                state['stats']['by_setup'][trade.get('setup','?')]['l'] += 1
+                log.info(f"  ❌ LOSS: {sym} -{pnl}% → TG sent")
+                del state['open_trades'][sym]
+                continue
+
         except: pass
         time.sleep(0.5)
 
@@ -606,6 +827,10 @@ def run_scan():
     state['scans_done'] += 1
     state['last_scan'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     log.info(f"Scan #{state['scans_done']} — {len(PAIRS)} pairs")
+    # Circuit breaker: pause after 3 consecutive losses
+    if check_circuit_breaker():
+        log.warning("Circuit breaker active — skipping scan")
+        return
 
     # Fetch BTC first for correlation gate
     kl_btc = None
@@ -628,6 +853,7 @@ def run_scan():
                 if ok:
                     last_fired[pair['sym']] = {'time': time.time()}
                     state['alerts_sent'] += 1
+                    journal_log_signal(sig, pair)  # 📓 Log to journal
                     # Track for BE management (IMPROVEMENT 5)
                     state['open_trades'][pair['sym']] = {
                         'dir':        sig['dir'],
@@ -711,6 +937,57 @@ def main():
                 log.debug(f"BE check error: {e}")
             time.sleep(60)
     threading.Thread(target=be_loop, daemon=True).start()
+
+    # Telegram command listener (every 30s)
+    # Supports: /stats /report /open /weekly
+    last_update_id = [0]
+    def tg_commands():
+        while True:
+            try:
+                r = requests.get(
+                    f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates',
+                    params={'offset': last_update_id[0]+1, 'timeout': 10},
+                    timeout=15
+                )
+                if r.ok:
+                    for upd in r.json().get('result', []):
+                        last_update_id[0] = upd['update_id']
+                        txt = upd.get('message',{}).get('text','').strip().lower()
+                        if txt in ('/stats','/report','/journal'):
+                            # Combine journal + live session stats
+                            journal_msg = journal_stats_report()
+                            w=state['stats'].get('wins',0); l=state['stats'].get('losses',0); b=state['stats'].get('be',0)
+                            tot=w+l+b
+                            sess_msg=(
+                                f"\n\n📊 <b>This Session:</b>\n"
+                                f"  ✅ Wins:    {w}\n"
+                                f"  ❌ Losses:  {l}\n"
+                                f"  ➡️ BE:       {b}\n"
+                                f"  WR: {round(w/tot*100) if tot else 0}%\n"
+                                f"  Open: {len(state['open_trades'])}\n"
+                                f"  Alerts sent: {state['alerts_sent']}"
+                            )
+                            send_tg(journal_msg + sess_msg)
+                        elif txt == '/open':
+                            j = load_journal()
+                            if j['open']:
+                                msg = "🔓 <b>Open trades:</b>\n" + "\n".join(
+                                    f"  • {sym}" for sym in j['open'])
+                            else:
+                                msg = "✅ No open trades right now"
+                            send_tg(msg)
+                        elif txt == '/help':
+                            send_tg(
+                                "📡 <b>SMC Bot Commands</b>\n\n"
+                                "/stats — full performance report\n"
+                                "/open  — show open trades\n"
+                                "/help  — show this menu"
+                            )
+            except Exception as e:
+                log.debug(f"TG command error: {e}")
+            time.sleep(30)
+    threading.Thread(target=tg_commands, daemon=True).start()
+    log.info("✓ Telegram command listener started (/stats /open /help)")
 
     # Main scan loop
     while True:
