@@ -362,19 +362,31 @@ def swings(kl, lb=5):
     return sh, sl
 
 # ── IMPROVEMENT 4: STRUCTURE-BASED SL ──────────
-def structure_sl(sh, sl_sw, i, direction, atr_v, swept=None, ob=None):
-    """SL at structural level — not fixed ATR multiple"""
-    buf = atr_v * 0.12
+def structure_sl(sh, sl_sw, i, direction, atr_v, swept=None, ob=None,
+                  wick_low=None, wick_high=None, setup=None):
+    """
+    SL placement logic per setup:
+    SWEEP_OB  → SL just below the wick low (tight, precise)
+    CHOCH     → SL below last swing low (structural)
+    BOS       → SL below last swing low (structural)
+    HTF       → SL below OB or swing low
+    """
+    buf = atr_v * 0.10  # small buffer
+
     if direction == 'BUY':
+        if setup == 'SWEEP_OB' and wick_low:
+            # Tightest SL: just below the swept wick
+            return wick_low - buf
+        # Structural SL for other setups
         lvls = []
-        if swept: lvls.append(swept - buf)
         if ob:    lvls.append(ob - buf)
-        rl = [(idx,p) for idx,p in sl_sw if idx <= i][-3:]
+        rl = [(idx,p) for idx,p in sl_sw if idx <= i][-2:]
         if rl: lvls.append(min(p for _,p in rl) - buf)
         return min(lvls) if lvls else None
     else:
+        if setup == 'SWEEP_OB' and wick_high:
+            return wick_high + buf
         lvls = []
-        if swept: lvls.append(swept + buf)
         if ob:    lvls.append(ob + buf)
         rh = [(idx,p) for idx,p in sh if idx <= i][-3:]
         if rh: lvls.append(max(p for _,p in rh) + buf)
@@ -600,12 +612,29 @@ def compute(kl, pair, kl_btc=None):
 
     is_buy = sig['dir'] == 'BUY'
 
-    # IMPROVEMENT 4: Structure-based SL
-    sw = sig.get('swept')
+    # IMPROVEMENT 4: Structure-based SL (setup-specific)
     ob_level = (sig['ob']['bot'] if is_buy else sig['ob']['top']) if sig.get('ob') else None
-    sl_p = structure_sl(sh, sl, i, sig['dir'], atr_a[i], sw, ob_level)
+
+    # For SWEEP_OB: find the actual wick low/high of the sweep candle
+    wick_low = wick_high = None
+    if sig['setup'] == 'SWEEP_OB':
+        # Find the candle that swept — it's the current candle (i)
+        # Its low IS the swept wick
+        wick_low  = kl[i]['l']   # the wick that swept sell-side
+        wick_high = kl[i]['h']   # the wick that swept buy-side
+
+    sl_p = structure_sl(sh, sl, i, sig['dir'], atr_a[i],
+                        sig.get('swept'), ob_level,
+                        wick_low, wick_high, sig['setup'])
     if sl_p is None:
         sl_p = price - atr_a[i]*1.5 if is_buy else price + atr_a[i]*1.5
+
+    # Safety: SL should not be more than 3% away (max risk cap)
+    max_risk = price * 0.03
+    if is_buy and (price - sl_p) > max_risk:
+        sl_p = price - max_risk
+    if not is_buy and (sl_p - price) > max_risk:
+        sl_p = price + max_risk
 
     risk = abs(price - sl_p)
     if risk <= 0: return None
