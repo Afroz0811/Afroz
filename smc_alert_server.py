@@ -299,6 +299,61 @@ def learn(db):
             db['weights']['session_weights'][sess] = new_m
             changes.append(f"{'↑' if new_m>current_m else '↓'} session '{sess}' mult {current_m:.2f}→{new_m:.2f} (WR:{wr:.0%})")
 
+    # ── Advanced ML: OB entry vs breakout entry quality ──────────────────
+    ob_trades    = [s for s in outcomes if s.get('ob_entry')]
+    noob_trades  = [s for s in outcomes if not s.get('ob_entry')]
+    if len(ob_trades) >= 3 and len(noob_trades) >= 3:
+        wr_ob  = sum(1 for t in ob_trades   if t['result']=='win') / len(ob_trades)
+        wr_nob = sum(1 for t in noob_trades if t['result']=='win') / len(noob_trades)
+        db['stats']['ob_entry_wr']   = round(wr_ob, 3)
+        db['stats']['noob_entry_wr'] = round(wr_nob, 3)
+        if wr_ob > wr_nob + 0.10:
+            changes.append(f"OB entry much better (WR {wr_ob:.0%} vs {wr_nob:.0%}) — prioritize OB pullbacks")
+
+    # ── Advanced ML: MAE/MFE entry timing ────────────────────────────────
+    timed = [s for s in outcomes if s.get('max_adverse') is not None
+             and s.get('max_favourable') is not None]
+    if len(timed) >= 5:
+        avg_mae = sum(s['max_adverse']    for s in timed) / len(timed)
+        avg_mfe = sum(s['max_favourable'] for s in timed) / len(timed)
+        ratio   = avg_mfe / max(avg_mae, 0.01)
+        db['stats']['mae_avg'] = round(avg_mae, 3)
+        db['stats']['mfe_avg'] = round(avg_mfe, 3)
+        db['stats']['mfe_mae_ratio'] = round(ratio, 2)
+        if ratio < 1.5:
+            changes.append(f"MFE/MAE={ratio:.1f}x — entries are LATE, price moves against before going our way")
+        else:
+            changes.append(f"MFE/MAE={ratio:.1f}x — entry timing OK")
+
+    # ── Advanced ML: Score tier win rates ────────────────────────────────
+    tier_wr = {}
+    for tier in ['A+','A','B','C']:
+        tier_t = [s for s in outcomes if s.get('score_tier') == tier]
+        if len(tier_t) >= 3:
+            wr_tier = sum(1 for t in tier_t if t['result']=='win') / len(tier_t)
+            tier_wr[tier] = round(wr_tier, 3)
+    if tier_wr:
+        db['stats']['score_tier_wr'] = tier_wr
+        best_tier = max(tier_wr, key=tier_wr.get)
+        changes.append(f"Best score tier: {best_tier} (WR {tier_wr[best_tier]:.0%})")
+
+    # ── Advanced ML: RSI zone win rates ──────────────────────────────────
+    rsi_wr = {}
+    for zone in ['oversold','neutral','overbought']:
+        zone_t = [s for s in outcomes if s.get('rsi_zone') == zone]
+        if len(zone_t) >= 3:
+            wr_zone = sum(1 for t in zone_t if t['result']=='win') / len(zone_t)
+            rsi_wr[zone] = round(wr_zone, 3)
+            # Update RSI zone weight
+            rz = db['weights'].get('rsi_zones', {})
+            old_w = rz.get(zone, 1.0)
+            target = 0.4 + wr_zone * 1.2
+            rz[zone] = round(max(0.3, min(2.0, old_w + lr*(target-old_w))), 3)
+            db['weights']['rsi_zones'] = rz
+    if rsi_wr:
+        db['stats']['rsi_zone_wr'] = rsi_wr
+
+
     # ── Learn RSI zone effectiveness ─────────────────────────────────
     for zone, stats in db['stats']['by_rsi_zone'].items():
         if stats['total'] < 5: continue
@@ -1812,11 +1867,59 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
             h2, h1p = rh5[-2][1], rh5[-3][1]
             l2, l1p = rl5[-2][1], rl5[-3][1]
             vol_ok = kl[i]['v'] > va_a[i]*1.05
+
+            # ── TIMING FIX: Don't enter ON the CHoCH break candle ──────────────
+            # CHoCH break candle = price first crosses h2 (the broken swing high)
+            # Entering there = chasing top of the impulse move (exactly what you circled)
+            # 
+            # CORRECT entry: wait for pullback into the OB (last bearish candle
+            # before the CHoCH impulse leg). Price must retrace AT LEAST 30% of
+            # the impulse before we enter — this confirms structure held and gives
+            # a better R:R than chasing the breakout.
+            #
+            # We also check that price is not MORE than 3 ATR above h2 —
+            # if it is, the move has already extended too far.
+
             if (h2 < h1p and l2 < l1p and price > h2 and
                     e20_a[i] and price > e20_a[i] and ht_a[i] > 0 and
                     rsi_a[i] and 28 < rsi_a[i] < 65 and vol_ok and
                     weekly_b != 'bearish'):
+
+                # Find the CHoCH impulse start (lowest low before h2)
+                impulse_start = next((kl[j]['l'] for j in range(rh5[-2][0], max(0, rh5[-2][0]-15), -1)
+                                      if kl[j]['l'] <= l2), l2)
+                impulse_size  = h2 - impulse_start  # total impulse height
+                dist_from_h2  = price - h2           # how far above CHoCH level
+
+                # Find OB (last bearish candle before CHoCH break)
+                ob_top = ob_bot = None
+                for j in range(rh5[-2][0]-1, max(0, rh5[-2][0]-8), -1):
+                    if kl[j]['c'] < kl[j]['o']:  # bearish candle
+                        ob_top = kl[j]['o']; ob_bot = kl[j]['l']; break
+
+                # Entry conditions:
+                # A) Price pulled back into OB zone (ideal entry)
+                # B) OR price < 1.5 ATR above CHoCH (didn't chase too far)
+                # Reject if: price > 3 ATR above CHoCH (chasing extended move)
+                too_extended = dist_from_h2 > atr_a[i] * 3.0
+                in_ob_zone   = ob_top and ob_bot and ob_bot <= price <= ob_top * 1.005
+                acceptable_dist = dist_from_h2 <= atr_a[i] * 1.5
+
+                if too_extended:
+                    continue  # Skip — price has run too far, don't chase
+
+                if not (in_ob_zone or acceptable_dist):
+                    continue  # Skip — not in OB and not close enough to CHoCH
+
+                # Boost score if in OB zone (cleanest entry)
+                choch_score = 8
+                if in_ob_zone: choch_score += 0.5
+                choch_tags  = ['CHoCH↑', 'CleanStr', 'Vol✓', 'MACD✓',
+                                f'RSI{round(rsi_a[i])}']
+                if in_ob_zone: choch_tags.append('OB_Entry✓')
+
                 return {'dir':'BUY', 'setup':'CHOCH',
+                        'score': choch_score,
                         'name':'🔄 CHoCH Reversal (Bear→Bull)',
                         'score': 8, 'ob': None, 'swept': None,
                         'tags': ['CHoCH↑','CleanStr','Vol✓','MACD✓',
@@ -1825,6 +1928,24 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                     e20_a[i] and price < e20_a[i] and ht_a[i] < 0 and
                     rsi_a[i] and 35 < rsi_a[i] < 72 and vol_ok and
                     weekly_b != 'bullish'):
+
+                # Timing fix for SELL: don't enter on the break candle
+                impulse_size_s = l2 - next((kl[j]['h'] for j in range(rl5[-2][0],
+                    max(0, rl5[-2][0]-15), -1) if kl[j]['h'] >= h2), h2)
+                dist_from_l2   = l2 - price
+                ob_top_s = ob_bot_s = None
+                for j in range(rl5[-2][0]-1, max(0, rl5[-2][0]-8), -1):
+                    if kl[j]['c'] > kl[j]['o']:
+                        ob_top_s = kl[j]['h']; ob_bot_s = kl[j]['c']; break
+                too_ext_s   = dist_from_l2 > atr_a[i] * 3.0
+                in_ob_s     = ob_top_s and ob_bot_s and ob_bot_s * 0.995 <= price <= ob_top_s
+                ok_dist_s   = dist_from_l2 <= atr_a[i] * 1.5
+                if too_ext_s: continue
+                if not (in_ob_s or ok_dist_s): continue
+                choch_score_s = 8 + (0.5 if in_ob_s else 0)
+                choch_tags_s  = ['CHoCH↓', 'CleanStr', 'Vol✓', 'MACD✓', f'RSI{round(rsi_a[i])}']
+                if in_ob_s: choch_tags_s.append('OB_Entry✓')
+
                 return {'dir':'SELL', 'setup':'CHOCH',
                         'name':'🔄 CHoCH Reversal (Bull→Bear)',
                         'score': 8, 'ob': None, 'swept': None,
@@ -1882,7 +2003,12 @@ def compute(kl, pair, kl_btc=None):
     session_on = in_session(hour)
     # We pass this info through but don't hard-block
 
-    # Cooldown check
+    # ── HARD LOCK: no new signal while trade open for this pair ────────────
+    if pair['sym'] in state['open_trades']:
+        log.debug(f"  {pair['sym']}: trade open — blocking new signal until TP/SL")
+        return None
+
+    # ── Cooldown check ───────────────────────────────────────────────────
     lf = last_fired.get(pair['sym'])
     if lf and (time.time()-lf['time'])/60 < COOLDOWN_M:
         return None  # Still in cooldown for this coin
@@ -2291,6 +2417,16 @@ def check_prices():
             tp2_p  = trade['tp']
             tp3_p  = trade.get('tp3', tp2_p)
 
+            # ── Track excursions for advanced ML ──────────────────────────────
+            # MAE = Max Adverse Excursion (how far against us it went)
+            # MFE = Max Favourable Excursion (how far in our direction it went)
+            move = (price-entry)/entry*100 if is_buy else (entry-price)/entry*100
+            trade['max_favourable'] = max(trade.get('max_favourable',0), move)
+            adverse = (entry-price)/entry*100 if is_buy else (price-entry)/entry*100
+            trade['max_adverse']    = max(trade.get('max_adverse',0), adverse)
+            # Bars held approximation (1 check ≈ 1 min → /60 for hours)
+            trade['bars_held']      = trade.get('bars_held',0) + 1
+
             # TP1: Breakeven
             if not trade.get('be_triggered'):
                 if (is_buy and price>=tp1_p) or (not is_buy and price<=tp1_p):
@@ -2566,6 +2702,24 @@ def run_scan():
                         'rsi_val':    sig.get('rsi_val',50),
                         'session_name': session_now,
                         'learn_id':   learn_id,
+                        # ── Advanced ML tracking fields (v4) ──────────────────
+                        'sl_pct':     round(abs(sig['price']-sig['sl'])/sig['price']*100,3),
+                        'entry_atr_mult': round(abs(sig['price']-sig['sl'])/max(sig.get('atr_v',1),1),2),
+                        'ob_entry':   'OB_Entry✓' in sig.get('tags',[]),
+                        'rsi_zone':   ('oversold' if sig.get('rsi_val',50)<35
+                                       else 'overbought' if sig.get('rsi_val',50)>65
+                                       else 'neutral'),
+                        'hour_utc':   datetime.now(timezone.utc).hour,
+                        'ema_aligned': ('EMA↑' in sig.get('tags',[]) or
+                                        'EMA↓' in sig.get('tags',[])),
+                        'vol_surge':  'Vol✓' in sig.get('tags',[]),
+                        'score_tier': ('A+' if sig['score']>=9 else
+                                       'A'  if sig['score']>=8 else
+                                       'B'  if sig['score']>=7 else 'C'),
+                        'exit_reason': None,  # filled when trade closes
+                        'bars_held':  0,       # updated on close
+                        'max_adverse': 0.0,    # max drawdown against us
+                        'max_favourable': 0.0, # max move in our favour
                     }
                     state['open_trades'][pair['sym']] = trade_entry
                     journal_log_signal(sig, pair)
