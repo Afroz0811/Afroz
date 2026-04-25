@@ -1905,16 +1905,9 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                 in_ob_zone   = ob_top and ob_bot and ob_bot <= price <= ob_top * 1.005
                 acceptable_dist = dist_from_h2 <= atr_a[i] * 1.5
 
-                if too_extended:
-                    continue  # Skip — price has run too far, don't chase
-
-                if not (in_ob_zone or acceptable_dist):
-                    continue  # Skip — not in OB and not close enough to CHoCH
-
-                # Boost score if in OB zone (cleanest entry)
-                choch_score = 8
-                if in_ob_zone: choch_score += 0.5
-                choch_tags  = ['CHoCH↑', 'CleanStr', 'Vol✓', 'MACD✓',
+                if not too_extended and (in_ob_zone or acceptable_dist):
+                    choch_score = 8 + (0.5 if in_ob_zone else 0)
+                    choch_tags  = ['CHoCH↑', 'CleanStr', 'Vol✓', 'MACD✓',
                                 f'RSI{round(rsi_a[i])}']
                 if in_ob_zone: choch_tags.append('OB_Entry✓')
 
@@ -1940,13 +1933,12 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                 too_ext_s   = dist_from_l2 > atr_a[i] * 3.0
                 in_ob_s     = ob_top_s and ob_bot_s and ob_bot_s * 0.995 <= price <= ob_top_s
                 ok_dist_s   = dist_from_l2 <= atr_a[i] * 1.5
-                if too_ext_s: continue
-                if not (in_ob_s or ok_dist_s): continue
-                choch_score_s = 8 + (0.5 if in_ob_s else 0)
-                choch_tags_s  = ['CHoCH↓', 'CleanStr', 'Vol✓', 'MACD✓', f'RSI{round(rsi_a[i])}']
-                if in_ob_s: choch_tags_s.append('OB_Entry✓')
+                if not too_ext_s and (in_ob_s or ok_dist_s):
+                    choch_score_s = 8 + (0.5 if in_ob_s else 0)
+                    choch_tags_s  = ['CHoCH↓', 'CleanStr', 'Vol✓', 'MACD✓', f'RSI{round(rsi_a[i])}']
+                    if in_ob_s: choch_tags_s.append('OB_Entry✓')
 
-                return {'dir':'SELL', 'setup':'CHOCH',
+                    return {'dir':'SELL', 'setup':'CHOCH',
                         'name':'🔄 CHoCH Reversal (Bull→Bear)',
                         'score': 8, 'ob': None, 'swept': None,
                         'tags': ['CHoCH↓','CleanStr','Vol✓','MACD✓',
