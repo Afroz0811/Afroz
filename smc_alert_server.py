@@ -1,5 +1,5 @@
 """
-SMC Engine Pro v4 — 24/7 Alert Server
+SMC Engine Pro v3 — 24/7 Alert Server
 Railway-compatible | All 5 improvements built in
 
 Improvements over v2:
@@ -299,61 +299,6 @@ def learn(db):
             db['weights']['session_weights'][sess] = new_m
             changes.append(f"{'↑' if new_m>current_m else '↓'} session '{sess}' mult {current_m:.2f}→{new_m:.2f} (WR:{wr:.0%})")
 
-    # ── Advanced ML: OB entry vs breakout entry quality ──────────────────
-    ob_trades    = [s for s in outcomes if s.get('ob_entry')]
-    noob_trades  = [s for s in outcomes if not s.get('ob_entry')]
-    if len(ob_trades) >= 3 and len(noob_trades) >= 3:
-        wr_ob  = sum(1 for t in ob_trades   if t['result']=='win') / len(ob_trades)
-        wr_nob = sum(1 for t in noob_trades if t['result']=='win') / len(noob_trades)
-        db['stats']['ob_entry_wr']   = round(wr_ob, 3)
-        db['stats']['noob_entry_wr'] = round(wr_nob, 3)
-        if wr_ob > wr_nob + 0.10:
-            changes.append(f"OB entry much better (WR {wr_ob:.0%} vs {wr_nob:.0%}) — prioritize OB pullbacks")
-
-    # ── Advanced ML: MAE/MFE entry timing ────────────────────────────────
-    timed = [s for s in outcomes if s.get('max_adverse') is not None
-             and s.get('max_favourable') is not None]
-    if len(timed) >= 5:
-        avg_mae = sum(s['max_adverse']    for s in timed) / len(timed)
-        avg_mfe = sum(s['max_favourable'] for s in timed) / len(timed)
-        ratio   = avg_mfe / max(avg_mae, 0.01)
-        db['stats']['mae_avg'] = round(avg_mae, 3)
-        db['stats']['mfe_avg'] = round(avg_mfe, 3)
-        db['stats']['mfe_mae_ratio'] = round(ratio, 2)
-        if ratio < 1.5:
-            changes.append(f"MFE/MAE={ratio:.1f}x — entries are LATE, price moves against before going our way")
-        else:
-            changes.append(f"MFE/MAE={ratio:.1f}x — entry timing OK")
-
-    # ── Advanced ML: Score tier win rates ────────────────────────────────
-    tier_wr = {}
-    for tier in ['A+','A','B','C']:
-        tier_t = [s for s in outcomes if s.get('score_tier') == tier]
-        if len(tier_t) >= 3:
-            wr_tier = sum(1 for t in tier_t if t['result']=='win') / len(tier_t)
-            tier_wr[tier] = round(wr_tier, 3)
-    if tier_wr:
-        db['stats']['score_tier_wr'] = tier_wr
-        best_tier = max(tier_wr, key=tier_wr.get)
-        changes.append(f"Best score tier: {best_tier} (WR {tier_wr[best_tier]:.0%})")
-
-    # ── Advanced ML: RSI zone win rates ──────────────────────────────────
-    rsi_wr = {}
-    for zone in ['oversold','neutral','overbought']:
-        zone_t = [s for s in outcomes if s.get('rsi_zone') == zone]
-        if len(zone_t) >= 3:
-            wr_zone = sum(1 for t in zone_t if t['result']=='win') / len(zone_t)
-            rsi_wr[zone] = round(wr_zone, 3)
-            # Update RSI zone weight
-            rz = db['weights'].get('rsi_zones', {})
-            old_w = rz.get(zone, 1.0)
-            target = 0.4 + wr_zone * 1.2
-            rz[zone] = round(max(0.3, min(2.0, old_w + lr*(target-old_w))), 3)
-            db['weights']['rsi_zones'] = rz
-    if rsi_wr:
-        db['stats']['rsi_zone_wr'] = rsi_wr
-
-
     # ── Learn RSI zone effectiveness ─────────────────────────────────
     for zone, stats in db['stats']['by_rsi_zone'].items():
         if stats['total'] < 5: continue
@@ -484,7 +429,7 @@ def performance_report():
             lines.append(f"  {ch}")
 
     lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
-    lines.append("📡 <b>SMC Engine Pro v4 — Self Learning</b>")
+    lines.append("📡 <b>SMC Engine Pro v3 — Self Learning</b>")
     return '\n'.join(lines)
 
 def weekly_learning_report():
@@ -1045,7 +990,7 @@ TG_TOKEN   = os.environ.get('TG_TOKEN', '')
 TG_CHAT    = os.environ.get('TG_CHAT', '')
 MIN_SCORE  = int(os.environ.get('MIN_SCORE', '6'))
 SCAN_EVERY = int(os.environ.get('SCAN_EVERY_MIN', '1'))
-COOLDOWN_M = int(os.environ.get('COOLDOWN_MIN', '30'))
+COOLDOWN_M = int(os.environ.get('COOLDOWN_MIN', '60'))  # min 60min between same-coin signals
 PORT       = int(os.environ.get('PORT', '8080'))
 
 PAIRS = [
@@ -1173,190 +1118,10 @@ def journal_stats_report():
                 f"💔 Worst: {worst['sym']} {worst.get('pnl',0):.2f}% ({worst['setup']})"]
         if j['open']:
             lines.append(f"\n🔓 Open: {', '.join(j['open'].keys())}")
-        lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v4")
+        lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3")
         return '\n'.join(lines)
     except Exception as e:
         return f"Journal error: {e}"
-
-
-# ════════════════════════════════════════════════
-# DATA PERSISTENCE MANAGER
-# ════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════
-# DATA PERSISTENCE MANAGER
-# ════════════════════════════════════════════════════════════════
-"""
-Solves the Railway redeploy data loss problem.
-
-Strategy (3 layers):
-  1. Railway Volume (best)  — mount /data, all JSON files live there
-  2. TG file backup         — on startup, if files missing, pull from TG
-  3. TG file backup         — every 6 hours, push latest JSON to TG as file
-
-This means even if Railway volume fails, data is always recoverable
-from your own Telegram chat.
-"""
-
-import base64, zlib
-
-# All data files that must survive redeploys
-DATA_FILES = {
-    'smc_learning':    LEARN_FILE,
-    'smc_deep':        DEEP_LEARN_FILE,
-    'smc_journal':     JOURNAL_FILE,
-}
-
-# Add scalp file if this is the gold server
-try:
-    DATA_FILES['gold_scalp'] = SCALP_LEARN_FILE
-except NameError:
-    pass
-
-def _tg_send_file(filepath, caption):
-    """Send a JSON file to Telegram as document"""
-    if not TG_TOKEN or not TG_CHAT: return False
-    if not Path(filepath).exists(): return False
-    try:
-        with open(filepath, 'rb') as f:
-            data = f.read()
-        fname = Path(filepath).name
-        r = requests.post(
-            f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument',
-            data={'chat_id': TG_CHAT, 'caption': caption},
-            files={'document': (fname, data, 'application/json')},
-            timeout=30
-        )
-        return r.ok
-    except Exception as e:
-        log.debug(f"TG file send error: {e}")
-        return False
-
-def _tg_get_latest_file(filename_pattern):
-    """
-    Get latest backup file from TG.
-    Searches last 100 messages for a document matching the pattern.
-    Returns file content as string, or None.
-    """
-    if not TG_TOKEN or not TG_CHAT: return None
-    try:
-        r = requests.get(
-            f'https://api.telegram.org/bot{TG_TOKEN}/getUpdates',
-            params={'limit': 100, 'timeout': 5},
-            timeout=10
-        )
-        if not r.ok: return None
-        msgs = r.json().get('result', [])
-        # Search in reverse (newest first)
-        for upd in reversed(msgs):
-            msg = upd.get('message', {})
-            doc = msg.get('document', {})
-            if doc.get('file_name', '').startswith(filename_pattern.replace('.json','')):
-                # Download the file
-                file_id = doc['file_id']
-                r2 = requests.get(
-                    f'https://api.telegram.org/bot{TG_TOKEN}/getFile',
-                    params={'file_id': file_id}, timeout=10
-                )
-                if not r2.ok: continue
-                file_path = r2.json()['result']['file_path']
-                r3 = requests.get(
-                    f'https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}',
-                    timeout=15
-                )
-                if r3.ok: return r3.text
-    except Exception as e:
-        log.debug(f"TG file restore error: {e}")
-    return None
-
-def backup_data_to_tg(silent=False):
-    """
-    Backup all learning/journal JSON files to Telegram.
-    Called every 6 hours and on graceful shutdown.
-    """
-    backed_up = []
-    for name, filepath in DATA_FILES.items():
-        if not Path(filepath).exists(): continue
-        try:
-            size = Path(filepath).stat().st_size
-            if size < 10: continue  # skip empty files
-            caption = (
-                f"💾 <b>SMC Data Backup</b> — {name}\n"
-                f"Size: {size:,} bytes\n"
-                f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
-                f"<i>Auto-restore on next redeploy</i>"
-            )
-            ok = _tg_send_file(filepath, caption)
-            if ok:
-                backed_up.append(name)
-                log.info(f"  💾 Backed up {name} ({size:,} bytes)")
-        except Exception as e:
-            log.debug(f"Backup {name}: {e}")
-
-    if backed_up and not silent:
-        send_tg(
-            f"💾 <b>Data Backup Complete</b>\n\n"
-            f"Backed up: {', '.join(backed_up)}\n"
-            f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n\n"
-            f"<i>Files saved to this chat. Auto-restore on redeploy.</i>"
-        )
-    return backed_up
-
-def restore_data_from_tg():
-    """
-    On startup: check if any data files are missing.
-    If missing, search TG messages for latest backup and restore.
-    Called once at startup before anything else runs.
-    """
-    restored = []; missing = []
-
-    for name, filepath in DATA_FILES.items():
-        if Path(filepath).exists():
-            size = Path(filepath).stat().st_size
-            if size > 10:
-                log.info(f"  ✓ {name}: exists ({size:,} bytes)")
-                continue  # file is fine
-
-        # File missing or empty — try to restore from TG
-        log.info(f"  ⚠ {name}: missing — searching TG for backup...")
-        fname = Path(filepath).name
-        content = _tg_get_latest_file(fname)
-        if content:
-            try:
-                # Validate it's valid JSON
-                parsed = json.loads(content)
-                # Ensure directory exists
-                Path(filepath).parent.mkdir(parents=True, exist_ok=True)
-                with open(filepath, 'w') as f:
-                    json.dump(parsed, f, indent=2)
-                size = len(content)
-                log.info(f"  ✅ Restored {name} from TG ({size:,} bytes)")
-                restored.append(name)
-            except Exception as e:
-                log.warning(f"  ✗ Restore {name} failed: {e}")
-                missing.append(name)
-        else:
-            log.info(f"  ℹ No TG backup found for {name} — starting fresh")
-            missing.append(name)
-
-    return restored, missing
-
-def start_backup_loop():
-    """Background thread: backup every 6 hours"""
-    def _loop():
-        # Wait 10 min before first backup (let server stabilize)
-        time.sleep(600)
-        while True:
-            try:
-                backed = backup_data_to_tg(silent=True)
-                if backed:
-                    log.info(f"Auto-backup: {', '.join(backed)}")
-            except Exception as e:
-                log.debug(f"Auto-backup error: {e}")
-            time.sleep(6 * 3600)  # every 6 hours
-    threading.Thread(target=_loop, daemon=True).start()
-    log.info("✓ Auto-backup loop started (every 6h)")
-
-
 
 def check_circuit_breaker():
     """Pause trading after 3 consecutive losses"""
@@ -1401,7 +1166,7 @@ class Health(BaseHTTPRequestHandler):
             for sym, v in state['open_trades'].items()
         ) or '  (none)'
         body = (
-            f"SMC Engine Pro v4\n"
+            f"SMC Engine Pro v3\n"
             f"{'='*40}\n"
             f"Started:      {state['started']}\n"
             f"Last scan:    {state['last_scan']}\n"
@@ -1580,131 +1345,6 @@ def structure_sl(sh, sl_sw, i, direction, atr_v, swept=None, ob=None,
         if rh: lvls.append(max(p for _,p in rh) + buf)
         return max(lvls) if lvls else None
 
-# ── RANGE DETECTION ─────────────────────────────────────────────
-def detect_range(kl, i, atr_a, lb=24):
-    """
-    Detect sideways/range-bound market.
-    Backtest: WR 25% in range vs 100% in trend.
-    Score penalty of -2.0 applied when ranging.
-    """
-    if i < lb+10: return False, None, None
-    window = kl[i-lb:i+1]
-    rng_hi = max(x['h'] for x in window)
-    rng_lo = min(x['l'] for x in window)
-    at = atr_a[i]
-    if not at: return False, None, None
-    past_atr = [a for a in atr_a[max(0,i-20):i] if a]
-    if not past_atr: return False, None, None
-    atr_shrinking = at < (sum(past_atr)/len(past_atr)) * 0.75
-    tight = (rng_hi - rng_lo) < at * 1.8 * lb / 14
-    is_range = atr_shrinking and tight
-    return is_range, rng_hi, rng_lo
-
-def atr_expanding(atr_a, i):
-    """ATR expanding = volatility incoming = trending = better setups"""
-    if i < 20 or not atr_a[i]: return False
-    past = [a for a in atr_a[i-15:i] if a]
-    return bool(past) and atr_a[i] > (sum(past)/len(past)) * 1.05
-
-# ── AUCTION MARKET THEORY (AMT) ──────────────────────────────────
-def calc_value_area(kl, i, lb=24):
-    """
-    AMT Value Area — where 70% of volume traded.
-    VAL = bottom of value area = institutional buy zone
-    VAH = top of value area = institutional sell zone
-    POC = highest volume price = magnet/continuation level
-    At VAL on BUY or VAH on SELL = +1.5 score boost
-    """
-    if i < lb+5: return None
-    window = kl[i-lb:i+1]
-    lo_p = min(x['l'] for x in window)
-    hi_p = max(x['h'] for x in window)
-    rng  = hi_p - lo_p
-    if rng <= 0: return None
-    n_b = 20; bsz = rng / n_b
-    bkts = [0.0] * n_b
-    for k in window:
-        b = min(int(((k['h']+k['l']+k['c'])/3 - lo_p) / bsz), n_b-1)
-        bkts[b] += k['v']
-    tv = sum(bkts)
-    if tv <= 0: return None
-    poc_b = bkts.index(max(bkts))
-    poc   = lo_p + (poc_b + 0.5) * bsz
-    target = tv * 0.70; covered = bkts[poc_b]
-    lb_ = poc_b; hb_ = poc_b
-    while covered < target:
-        la = bkts[lb_-1] if lb_ > 0 else 0
-        ha = bkts[hb_+1] if hb_ < n_b-1 else 0
-        if la >= ha and lb_ > 0: lb_ -= 1; covered += la
-        elif hb_ < n_b-1:        hb_ += 1; covered += ha
-        else: break
-    return {'val': lo_p + lb_ * bsz, 'vah': lo_p + (hb_+1) * bsz,
-            'poc': poc, 'spread': rng}
-
-def amt_score_boost(price, direction, va):
-    if not va or va['spread'] <= 0: return 0.0, None
-    tol = va['spread'] * 0.07
-    if direction == 'BUY'  and abs(price - va['val']) < tol: return 1.5, 'AMT_VAL'
-    if direction == 'SELL' and abs(price - va['vah']) < tol: return 1.5, 'AMT_VAH'
-    if abs(price - va['poc']) < va['spread'] * 0.05:         return 0.8, 'AMT_POC'
-    return 0.0, None
-
-# ── PREVIOUS TRADE CONFLUENCE ─────────────────────────────────────
-def prev_trade_confluence(sym, price, direction, atr_v):
-    """
-    Market memory: price levels that worked before tend to work again.
-    Near previous WIN  = validates level  (+1.0 score)
-    Near previous LOSS = weak level       (-1.5 score)
-    """
-    try:
-        j = load_journal()
-        coin_trades = [t for t in j.get('signals', [])
-                       if t.get('sym') == sym
-                       and t.get('status') in ('win','loss','be')
-                       and t.get('entry')][-20:]
-        for t in reversed(coin_trades):
-            dist = abs(price - t['entry']) / price
-            if dist > 0.025: continue
-            if t['status'] == 'win'  and t.get('dir') == direction: return  1.0, 'PrevWin'
-            if t['status'] == 'loss' and t.get('dir') == direction and dist < 0.012:
-                return -1.5, 'PrevLoss'
-    except: pass
-    return 0.0, None
-
-# ── EMA200 MACRO FILTER ───────────────────────────────────────────
-def ema200_boost(closes, i, direction):
-    """
-    EMA200 = macro trend. With macro = +0.5. Against macro = -0.8.
-    Not a hard block — score adjustment only.
-    """
-    e200 = ema(closes, 200)
-    if not e200[i]: return 0.0
-    if direction == 'BUY'  and closes[i] > e200[i]:        return  0.5
-    if direction == 'SELL' and closes[i] < e200[i]:        return  0.5
-    if direction == 'BUY'  and closes[i] < e200[i]*0.98:  return -0.8
-    if direction == 'SELL' and closes[i] > e200[i]*1.02:  return -0.8
-    return 0.0
-
-# ── ROUND NUMBER ──────────────────────────────────────────────────
-def round_number_boost(price, atr_v):
-    """Psychological S/R levels on crypto. +0.5 when at round number."""
-    import math
-    if price <= 0 or not atr_v: return 0.0, None
-    mag = 10 ** max(0, int(math.log10(price)) - 1)
-    nearest = round(price / mag) * mag
-    if abs(price - nearest) / atr_v < 0.6: return 0.5, 'RndNum'
-    return 0.0, None
-
-# ── PREV SESSION HIGH/LOW ─────────────────────────────────────────
-def prev_session_sr(kl, i, price, direction, atr_v):
-    """Previous 24h high/low = watched by algos and institutions. +0.7."""
-    if i < 24 or not atr_v: return 0.0, None
-    ph = max(k['h'] for k in kl[i-24:i])
-    pl = min(k['l'] for k in kl[i-24:i])
-    if direction == 'BUY'  and abs(price - pl) / atr_v < 0.6: return 0.7, 'PrevLo'
-    if direction == 'SELL' and abs(price - ph) / atr_v < 0.6: return 0.7, 'PrevHi'
-    return 0.0, None
-
 # ── SIGNAL DETECTION ───────────────────────────
 def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                ht_a, atr_a, va_a, weekly_b, daily_b):
@@ -1867,52 +1507,11 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
             h2, h1p = rh5[-2][1], rh5[-3][1]
             l2, l1p = rl5[-2][1], rl5[-3][1]
             vol_ok = kl[i]['v'] > va_a[i]*1.05
-
-            # ── TIMING FIX: Don't enter ON the CHoCH break candle ──────────────
-            # CHoCH break candle = price first crosses h2 (the broken swing high)
-            # Entering there = chasing top of the impulse move (exactly what you circled)
-            # 
-            # CORRECT entry: wait for pullback into the OB (last bearish candle
-            # before the CHoCH impulse leg). Price must retrace AT LEAST 30% of
-            # the impulse before we enter — this confirms structure held and gives
-            # a better R:R than chasing the breakout.
-            #
-            # We also check that price is not MORE than 3 ATR above h2 —
-            # if it is, the move has already extended too far.
-
             if (h2 < h1p and l2 < l1p and price > h2 and
                     e20_a[i] and price > e20_a[i] and ht_a[i] > 0 and
                     rsi_a[i] and 28 < rsi_a[i] < 65 and vol_ok and
                     weekly_b != 'bearish'):
-
-                # Find the CHoCH impulse start (lowest low before h2)
-                impulse_start = next((kl[j]['l'] for j in range(rh5[-2][0], max(0, rh5[-2][0]-15), -1)
-                                      if kl[j]['l'] <= l2), l2)
-                impulse_size  = h2 - impulse_start  # total impulse height
-                dist_from_h2  = price - h2           # how far above CHoCH level
-
-                # Find OB (last bearish candle before CHoCH break)
-                ob_top = ob_bot = None
-                for j in range(rh5[-2][0]-1, max(0, rh5[-2][0]-8), -1):
-                    if kl[j]['c'] < kl[j]['o']:  # bearish candle
-                        ob_top = kl[j]['o']; ob_bot = kl[j]['l']; break
-
-                # Entry conditions:
-                # A) Price pulled back into OB zone (ideal entry)
-                # B) OR price < 1.5 ATR above CHoCH (didn't chase too far)
-                # Reject if: price > 3 ATR above CHoCH (chasing extended move)
-                too_extended = dist_from_h2 > atr_a[i] * 3.0
-                in_ob_zone   = ob_top and ob_bot and ob_bot <= price <= ob_top * 1.005
-                acceptable_dist = dist_from_h2 <= atr_a[i] * 1.5
-
-                if not too_extended and (in_ob_zone or acceptable_dist):
-                    choch_score = 8 + (0.5 if in_ob_zone else 0)
-                    choch_tags  = ['CHoCH↑', 'CleanStr', 'Vol✓', 'MACD✓',
-                                f'RSI{round(rsi_a[i])}']
-                if in_ob_zone: choch_tags.append('OB_Entry✓')
-
                 return {'dir':'BUY', 'setup':'CHOCH',
-                        'score': choch_score,
                         'name':'🔄 CHoCH Reversal (Bear→Bull)',
                         'score': 8, 'ob': None, 'swept': None,
                         'tags': ['CHoCH↑','CleanStr','Vol✓','MACD✓',
@@ -1921,24 +1520,7 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                     e20_a[i] and price < e20_a[i] and ht_a[i] < 0 and
                     rsi_a[i] and 35 < rsi_a[i] < 72 and vol_ok and
                     weekly_b != 'bullish'):
-
-                # Timing fix for SELL: don't enter on the break candle
-                impulse_size_s = l2 - next((kl[j]['h'] for j in range(rl5[-2][0],
-                    max(0, rl5[-2][0]-15), -1) if kl[j]['h'] >= h2), h2)
-                dist_from_l2   = l2 - price
-                ob_top_s = ob_bot_s = None
-                for j in range(rl5[-2][0]-1, max(0, rl5[-2][0]-8), -1):
-                    if kl[j]['c'] > kl[j]['o']:
-                        ob_top_s = kl[j]['h']; ob_bot_s = kl[j]['c']; break
-                too_ext_s   = dist_from_l2 > atr_a[i] * 3.0
-                in_ob_s     = ob_top_s and ob_bot_s and ob_bot_s * 0.995 <= price <= ob_top_s
-                ok_dist_s   = dist_from_l2 <= atr_a[i] * 1.5
-                if not too_ext_s and (in_ob_s or ok_dist_s):
-                    choch_score_s = 8 + (0.5 if in_ob_s else 0)
-                    choch_tags_s  = ['CHoCH↓', 'CleanStr', 'Vol✓', 'MACD✓', f'RSI{round(rsi_a[i])}']
-                    if in_ob_s: choch_tags_s.append('OB_Entry✓')
-
-                    return {'dir':'SELL', 'setup':'CHOCH',
+                return {'dir':'SELL', 'setup':'CHOCH',
                         'name':'🔄 CHoCH Reversal (Bull→Bear)',
                         'score': 8, 'ob': None, 'swept': None,
                         'tags': ['CHoCH↓','CleanStr','Vol✓','MACD✓',
@@ -1995,12 +1577,13 @@ def compute(kl, pair, kl_btc=None):
     session_on = in_session(hour)
     # We pass this info through but don't hard-block
 
-    # ── HARD LOCK: no new signal while trade open for this pair ────────────
+    # ── HARD LOCK: no new signal while trade is open for this pair ──────
+    # Primary guard — prevents BUY then SELL or duplicate signals
     if pair['sym'] in state['open_trades']:
-        log.debug(f"  {pair['sym']}: trade open — blocking new signal until TP/SL")
+        log.debug(f"  {pair['sym']}: trade already open — blocking until TP/SL")
         return None
 
-    # ── Cooldown check ───────────────────────────────────────────────────
+    # ── Cooldown check (secondary guard) ─────────────────────────────
     lf = last_fired.get(pair['sym'])
     if lf and (time.time()-lf['time'])/60 < COOLDOWN_M:
         return None  # Still in cooldown for this coin
@@ -2069,56 +1652,9 @@ def compute(kl, pair, kl_btc=None):
     if _rsi_div(sig['dir']): bonus += 1.5; extra_tags.append('RSI_Div✓')
     if _fib_zone():           bonus += 0.5; extra_tags.append('Fib✓')
     if _vwap_ok(sig['dir']): bonus += 0.5; extra_tags.append('VWAP✓')
-
-    # ── NEW CONFLUENCES (v4 additions) ──────────────────────────────
-
-    # 1. Range detection — score penalty in sideways markets
-    #    Backtest: WR 25% ranging vs 100% trending
-    is_ranging, rng_hi, rng_lo = detect_range(kl, i, atr_a)
-    if is_ranging:
-        bonus -= 2.0
-        extra_tags.append('Range⚠')
-        log.debug(f"  Range market detected — score penalty applied")
-
-    # 2. ATR expanding — more volatile = cleaner moves
-    if atr_expanding(atr_a, i):
-        bonus += 0.3; extra_tags.append('ATR↑')
-
-    # 3. AMT Value Area — institutional accumulation/distribution zones
-    va_data = calc_value_area(kl, i)
-    amt_delta, amt_tag = amt_score_boost(price, sig['dir'], va_data)
-    if amt_delta != 0:
-        bonus += amt_delta
-        if amt_tag: extra_tags.append(amt_tag)
-
-    # 4. EMA200 macro alignment
-    e200_delta = ema200_boost(closes, i, sig['dir'])
-    if e200_delta != 0:
-        bonus += e200_delta
-        if e200_delta > 0: extra_tags.append('EMA200✓')
-        else: extra_tags.append('EMA200⚠')
-
-    # 5. Previous trade confluence — market memory
-    pt_delta, pt_tag = prev_trade_confluence(pair['sym'], price, sig['dir'], atr_a[i])
-    if pt_delta != 0:
-        bonus += pt_delta
-        if pt_tag: extra_tags.append(pt_tag)
-
-    # 6. Round number S/R
-    rnd_delta, rnd_tag = round_number_boost(price, atr_a[i])
-    if rnd_delta != 0 and rnd_tag:
-        bonus += rnd_delta; extra_tags.append(rnd_tag)
-
-    # 7. Previous session high/low
-    psr_delta, psr_tag = prev_session_sr(kl, i, price, sig['dir'], atr_a[i])
-    if psr_delta != 0 and psr_tag:
-        bonus += psr_delta; extra_tags.append(psr_tag)
-
     sig = dict(sig)
     sig['score']  = min(10, round(sig['score'] + bonus, 1))
     sig['tags']   = list(sig.get('tags', [])) + extra_tags
-    sig['is_ranging'] = is_ranging
-    sig['va_data']    = va_data
 
     is_buy = sig['dir'] == 'BUY'
 
@@ -2318,10 +1854,6 @@ def build_signal_msg(sig, pair):
         f"  Weekly: {esc(sig.get('weekly','—'))}  |  Daily: {esc(sig.get('daily','—'))}  |  RSI: {sig.get('rsi_val','—')}",
         (f"  OB Zone: {fp(sig['ob']['bot'])} – {fp(sig['ob']['top'])}" if sig.get('ob') else ""),
         (f"  Swept at: {fp(sig['swept'])}" if sig.get('swept') else ""),
-        (f"  📊 AMT: VAL={fp(sig['va_data']['val'])} POC={fp(sig['va_data']['poc'])} VAH={fp(sig['va_data']['vah'])}"
-         if sig.get('va_data') else ""),
-        ("⚠️ <i>Range market detected — lower conviction signal</i>"
-         if sig.get('is_ranging') else ""),
         sl_note,
         "",
         "📋 <b>Trade Management:</b>",
@@ -2330,7 +1862,7 @@ def build_signal_msg(sig, pair):
         "  • Let rest run to TP2, trail to TP3",
         "",
         "⚠️ <i>Not financial advice. Always manage risk.</i>",
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v4</b>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v3</b>",
     ]
     return '\n'.join(l for l in lines if l is not None)
 
@@ -2344,7 +1876,7 @@ def build_result_msg(sym, result, pnl, trade):
         f"{'🎯' if result=='WIN' else '🛑'} Exit:   {fp(trade.get('tp' if result=='WIN' else 'sl',0))}",
         f"📊 Score:  {trade.get('score',0)}/10",
         '',
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v4</b>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v3</b>",
     ])
 
 # ── TELEGRAM ───────────────────────────────────
@@ -2397,10 +1929,12 @@ def check_prices():
     for sym, trade in list(state['open_trades'].items()):
         try:
             pair   = next(p for p in PAIRS if p['sym'] == sym)
-            r      = requests.get(f'{CG}/simple/price',
-                       params={'ids': pair['cg'], 'vs_currencies': 'usd'},
-                       timeout=8)
-            price  = float(r.json()[pair['cg']]['usd'])
+            # Fetch candles to get actual high/low range (catches wick SL hits)
+            kl_chk = fetch_candles(pair, limit=5)
+            if not kl_chk: continue
+            price    = float(kl_chk[-1]['c'])
+            chk_hi   = max(k['h'] for k in kl_chk[-3:])  # candle HIGH
+            chk_lo   = min(k['l'] for k in kl_chk[-3:])  # candle LOW
             if not price: continue
             is_buy = trade['dir'] == 'BUY'
             entry  = trade['entry']
@@ -2409,19 +1943,9 @@ def check_prices():
             tp2_p  = trade['tp']
             tp3_p  = trade.get('tp3', tp2_p)
 
-            # ── Track excursions for advanced ML ──────────────────────────────
-            # MAE = Max Adverse Excursion (how far against us it went)
-            # MFE = Max Favourable Excursion (how far in our direction it went)
-            move = (price-entry)/entry*100 if is_buy else (entry-price)/entry*100
-            trade['max_favourable'] = max(trade.get('max_favourable',0), move)
-            adverse = (entry-price)/entry*100 if is_buy else (price-entry)/entry*100
-            trade['max_adverse']    = max(trade.get('max_adverse',0), adverse)
-            # Bars held approximation (1 check ≈ 1 min → /60 for hours)
-            trade['bars_held']      = trade.get('bars_held',0) + 1
-
             # TP1: Breakeven
             if not trade.get('be_triggered'):
-                if (is_buy and price>=tp1_p) or (not is_buy and price<=tp1_p):
+                if (is_buy and chk_hi>=tp1_p) or (not is_buy and chk_lo<=tp1_p):
                     trade['be_triggered'] = True
                     pnl1 = round(abs(tp1_p-entry)/entry*100,2)
                     send_tg(
@@ -2431,13 +1955,13 @@ def check_prices():
                         f"🎯 TP2 target: <code>{fp(tp2_p)}</code>\n"
                         f"🎯 TP3 runner: <code>{fp(tp3_p)}</code>\n\n"
                         f"<i>Trade is now risk-free. Let it run.</i>\n"
-                        f"📐 {trade.get('setup_name','—')}  |  📡 SMC Engine Pro v4"
+                        f"📐 {trade.get('setup_name','—')}  |  📡 SMC Engine Pro v3"
                     )
                     log.info(f"  🎯 {sym}: TP1 hit +{pnl1}%")
 
             # TP2: WIN
             if not trade.get('tp2_hit'):
-                if (is_buy and price>=tp2_p) or (not is_buy and price<=tp2_p):
+                if (is_buy and chk_hi>=tp2_p) or (not is_buy and chk_lo<=tp2_p):
                     trade['tp2_hit'] = True
                     pnl = round(abs(tp2_p-entry)/entry*100,2)
                     analysis = _analyze_win(trade)
@@ -2451,7 +1975,7 @@ def check_prices():
                         f"🏆 <b>Why it worked:</b>\n{analysis}\n\n"
                         f"🎯 TP3 runner still open: <code>{fp(tp3_p)}</code>\n"
                         f"   Trail SL to TP1 level now\n\n"
-                        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v4"
+                        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3"
                     )
                     lid = trade.get('learn_id')
                     if lid: close_trade(lid,'win',price)
@@ -2471,7 +1995,7 @@ def check_prices():
 
             # TP3: Runner
             if trade.get('tp2_hit') and not trade.get('tp3_hit'):
-                if (is_buy and price>=tp3_p) or (not is_buy and price<=tp3_p):
+                if (is_buy and chk_hi>=tp3_p) or (not is_buy and chk_lo<=tp3_p):
                     trade['tp3_hit'] = True
                     pnl = round(abs(tp3_p-entry)/entry*100,2)
                     send_tg(
@@ -2483,7 +2007,8 @@ def check_prices():
                     continue
 
             # SL: LOSS
-            if (is_buy and price<=sl_p) or (not is_buy and price>=sl_p):
+            # SL: use candle low for BUY, candle high for SELL (catches wick hits)
+            if (is_buy and chk_lo<=sl_p) or (not is_buy and chk_hi>=sl_p):
                 pnl = round(abs(sl_p-entry)/entry*100,2)
                 analysis = _analyze_loss(trade, price)
                 send_tg(
@@ -2495,7 +2020,7 @@ def check_prices():
                     f"⏱ Held: {_hours_held(trade)}\n\n"
                     f"🔍 <b>Failure Analysis:</b>\n{analysis}\n\n"
                     f"📚 <i>Engine is learning from this trade.</i>\n"
-                    f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v4"
+                    f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3"
                 )
                 lid = trade.get('learn_id')
                 if lid: close_trade(lid,'loss',price)
@@ -2608,7 +2133,7 @@ def build_signal_msg(sig, pair):
         '  • Move SL to breakeven (entry)',
         '  • Let remaining run to TP2, then TP3',
         '', '⚠️ <i>Not financial advice. Always manage risk.</i>',
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v4</b>",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 <b>SMC Engine Pro v3</b>",
     ]
     return '\n'.join(l for l in lines if l is not None)
 
@@ -2620,7 +2145,7 @@ def build_result_msg(sym, result, pnl, trade):
         f"💰 Entry: {fp(trade.get('entry',0))}",
         f"{'🎯' if result=='WIN' else '🛑'} Exit: {fp(trade.get('tp' if result=='WIN' else 'sl',0))}",
         f"📊 Score: {trade.get('score',0)}/10",
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v4",
+        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC  |  📡 SMC Engine Pro v3",
     ])
 
 def esc(s):
@@ -2694,24 +2219,6 @@ def run_scan():
                         'rsi_val':    sig.get('rsi_val',50),
                         'session_name': session_now,
                         'learn_id':   learn_id,
-                        # ── Advanced ML tracking fields (v4) ──────────────────
-                        'sl_pct':     round(abs(sig['price']-sig['sl'])/sig['price']*100,3),
-                        'entry_atr_mult': round(abs(sig['price']-sig['sl'])/max(sig.get('atr_v',1),1),2),
-                        'ob_entry':   'OB_Entry✓' in sig.get('tags',[]),
-                        'rsi_zone':   ('oversold' if sig.get('rsi_val',50)<35
-                                       else 'overbought' if sig.get('rsi_val',50)>65
-                                       else 'neutral'),
-                        'hour_utc':   datetime.now(timezone.utc).hour,
-                        'ema_aligned': ('EMA↑' in sig.get('tags',[]) or
-                                        'EMA↓' in sig.get('tags',[])),
-                        'vol_surge':  'Vol✓' in sig.get('tags',[]),
-                        'score_tier': ('A+' if sig['score']>=9 else
-                                       'A'  if sig['score']>=8 else
-                                       'B'  if sig['score']>=7 else 'C'),
-                        'exit_reason': None,  # filled when trade closes
-                        'bars_held':  0,       # updated on close
-                        'max_adverse': 0.0,    # max drawdown against us
-                        'max_favourable': 0.0, # max move in our favour
                     }
                     state['open_trades'][pair['sym']] = trade_entry
                     journal_log_signal(sig, pair)
@@ -2729,18 +2236,7 @@ def main():
     if not TG_TOKEN or not TG_CHAT:
         log.error("Missing TG_TOKEN or TG_CHAT"); raise SystemExit(1)
     log.info("="*55)
-    # ── Restore data from TG backup if files missing ────────────
-    log.info("Checking data files...")
-    restored, missing = restore_data_from_tg()
-    if restored:
-        send_tg(
-            f"✅ <b>Data Restored from Backup</b>\n\n"
-            f"Restored: {', '.join(restored)}\n"
-            f"<i>Previous learning data recovered!</i>"
-        )
-    elif missing:
-        log.info(f"Starting fresh for: {', '.join(missing)}")
-    log.info("SMC ENGINE PRO v4 — 24/7 SELF-LEARNING SERVER")
+    log.info("SMC ENGINE PRO v3 — 24/7 SELF-LEARNING SERVER")
     if TG_TOKEN:
         log.info(f"TG_TOKEN: {TG_TOKEN[:15]}...{TG_TOKEN[-6:]} (len={len(TG_TOKEN)})")
     log.info(f"TG_CHAT: {TG_CHAT}")
@@ -2750,11 +2246,10 @@ def main():
     log.info("="*55)
 
     threading.Thread(target=start_health, daemon=True).start()
-    start_backup_loop()  # auto-backup every 6h
     log.info(f"Health server on port {PORT}")
 
     send_tg(
-        "🚀 <b>SMC Engine Pro v4 — Self Learning Started</b>\n\n"
+        "🚀 <b>SMC Engine Pro v3 — Self Learning Started</b>\n\n"
         "<b>Settings:</b>\n"
         f"⏱ Scan every: {SCAN_EVERY} minute\n"
         f"🔁 Cooldown: {COOLDOWN_M} min\n"
@@ -2768,7 +2263,7 @@ def main():
         "📅 Every Monday → weekly learning report\n\n"
         "<b>Commands:</b>\n"
         "/stats /learn /weights /weekly /open /help\n\n"
-        "📡 <b>SMC Engine Pro v4 — Self Learning</b>"
+        "📡 <b>SMC Engine Pro v3 — Self Learning</b>"
     )
     log.info("✓ Startup TG message sent")
 
@@ -2845,26 +2340,16 @@ def main():
                         elif txt == '/reset_weights':
                             db = load_db(); db['weights']=DEFAULT_WEIGHTS.copy(); save_db(db)
                             send_tg("✅ Weights reset to defaults")
-                        elif txt in ('/backup', '/save'):
-                            backed = backup_data_to_tg()
                         elif txt == '/help':
                             send_tg(
-                                "📡 <b>SMC Engine Pro v4 Commands</b>\n\n"
+                                "📡 <b>SMC Bot Commands</b>\n\n"
                                 "/stats   — performance report\n"
-                                "/backup  — backup all data to TG now\n"
-                                "/learn   — ML learning weights\n"
-                                "/deep    — deep chart analysis\n"
+                                "/learn   — learning weights report\n"
+                                "/deep    — deep chart analysis report\n"
                                 "/weights — learned weights\n"
                                 "/weekly  — weekly summary\n"
                                 "/open    — open trades\n"
-                                "/help    — this menu\n\n"
-                                "<b>v4 new features:</b>\n"
-                                "📊 AMT Value Area on every signal\n"
-                                "📈 Range market detection (score penalty)\n"
-                                "🧠 Previous trade confluence\n"
-                                "📐 EMA200 macro filter\n"
-                                "🔢 Round number S/R\n"
-                                "📅 Prev session high/low"
+                                "/help    — this menu"
                             )
             except Exception as e:
                 log.debug(f"TG cmd error: {e}")
