@@ -223,8 +223,15 @@ def close_trade(trade_id, result, exit_price, bars_held=0):
 
     # Auto-learn after every 5 trades
     total = db['stats']['total_trades']
-    if total >= 10 and total % 5 == 0:
+    if total >= 5 and total % 5 == 0:
         learn(db)
+        # Also mine condition patterns
+        try:
+            discoveries = mine_conditions(db)
+            if discoveries:
+                log.info(f"  🧬 Pattern mining: {len(discoveries)} patterns found")
+        except Exception as e:
+            log.debug(f"Pattern mining: {e}")
 
     return sig
 
@@ -245,31 +252,32 @@ def learn(db):
     Uses Bayesian-style update: weight += learning_rate * (actual - expected)
     """
     outcomes = [s for s in db['signals'] if s['result']]
-    if len(outcomes) < 10:
+    if len(outcomes) < 5:
         return  # not enough data
 
-    lr = 0.15  # learning rate — how fast to adjust
+    # Learning rate: more aggressive when clear pattern (many trades)
+    n_trades = len(outcomes)
+    lr = min(0.35, 0.15 + (n_trades / 100) * 0.2)  # grows 0.15→0.35 as data accumulates
     changes = []
 
-    # ── Learn setup scores ──────────────────────────────────────────
+    # ── Learn setup scores (Bayesian update toward actual WR) ───────
     for setup, stats in db['stats']['by_setup'].items():
-        if stats['total'] < 5: continue
+        if stats['total'] < 3: continue  # lowered from 5
         wr = stats['w'] / stats['total']
         avg_pnl = stats['pnl'] / stats['total']
-        # Expected WR at current score
         current_score = db['weights']['setup_scores'].get(setup, 7.0)
-        # If WR > 55% and positive PnL → increase base score
-        # If WR < 35% → decrease base score
-        if wr > 0.55 and avg_pnl > 0:
-            new_score = min(9.5, current_score + lr)
-            if abs(new_score - current_score) > 0.05:
-                db['weights']['setup_scores'][setup] = round(new_score, 2)
-                changes.append(f"↑ {setup} score {current_score:.1f}→{new_score:.1f} (WR:{wr:.0%})")
-        elif wr < 0.35 or avg_pnl < -1:
-            new_score = max(5.0, current_score - lr)
-            if abs(new_score - current_score) > 0.05:
-                db['weights']['setup_scores'][setup] = round(new_score, 2)
-                changes.append(f"↓ {setup} score {current_score:.1f}→{new_score:.1f} (WR:{wr:.0%})")
+        # Target: map WR directly to score (WR=60%→score 8.5, WR=30%→score 5.5)
+        target_score = 5.0 + wr * 6.0
+        new_score = round(max(4.5, min(9.5, current_score + lr * (target_score - current_score))), 2)
+        if abs(new_score - current_score) > 0.05:
+            db['weights']['setup_scores'][setup] = new_score
+            arrow = '↑' if new_score > current_score else '↓'
+            changes.append(f"{arrow} {setup}: score {current_score:.1f}→{new_score:.1f} (WR:{wr:.0%} n={stats['total']})")
+        # Also raise/lower MIN_SCORE dynamically
+        if wr < 0.30 and stats['total'] >= 5:
+            # This setup keeps losing — raise its personal threshold
+            db['weights'].setdefault('min_score_by_setup', {})[setup] = round(min(9.0, current_score + 1.0), 1)
+            changes.append(f"⚠ {setup}: raising threshold to {db['weights']['min_score_by_setup'][setup]}")
 
     # ── Learn tag effectiveness ──────────────────────────────────────
     for tag, stats in db['stats']['by_tag'].items():
@@ -311,7 +319,35 @@ def learn(db):
             db['weights']['rsi_zones'][zone] = new_m
             changes.append(f"RSI zone '{zone}': mult {current_m:.2f}→{new_m:.2f} (WR:{wr:.0%})")
 
+    # ── Global WR-based threshold adjustment ──────────────────────────
+    total = db['stats']['total_trades']
+    wins  = db['stats']['wins']
+    if total >= 8:
+        overall_wr = wins / max(total, 1)
+        current_min = db['weights'].get('learned_min_score', 6.5)
+        if overall_wr < 0.35:
+            new_min = round(min(8.0, current_min + 0.2), 1)
+            if new_min != current_min:
+                db['weights']['learned_min_score'] = new_min
+                changes.append(f"↑ Min score raised: {current_min}→{new_min} (WR:{overall_wr:.0%})")
+        elif overall_wr > 0.58 and total >= 15:
+            new_min = round(max(5.5, current_min - 0.1), 1)
+            if new_min != current_min:
+                db['weights']['learned_min_score'] = new_min
+                changes.append(f"↓ Min score lowered: {current_min}→{new_min} (WR:{overall_wr:.0%})")
+
+    # ── MAE/MFE entry timing ──────────────────────────────────────────
+    timed = [s for s in outcomes if s.get('max_adverse') is not None]
+    if len(timed) >= 5:
+        avg_mae = sum(s['max_adverse'] for s in timed) / len(timed)
+        avg_mfe = sum(s.get('max_favourable', 0) for s in timed) / len(timed)
+        ratio   = avg_mfe / max(avg_mae, 0.01)
+        db['stats']['mfe_mae_ratio'] = round(ratio, 2)
+        if ratio < 1.2:
+            changes.append(f"⚠ MFE/MAE={ratio:.1f}x — entries too late (consider tighter entry)")
+
     if changes:
+        db['learn_count'] = db.get('learn_count', 0) + 1
         log_entry = {
             'time':    datetime.now(timezone.utc).isoformat(),
             'trades':  len(outcomes),
@@ -319,6 +355,19 @@ def learn(db):
         }
         db['learning_log'].append(log_entry)
         db['last_learned'] = log_entry['time']
+        # Send TG notification every 3rd cycle so you can see ML decisions
+        if db['learn_count'] % 3 == 0 and TG_TOKEN and TG_CHAT:
+            try:
+                import requests as _rq
+                _rq.post(
+                    f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+                    json={'chat_id': TG_CHAT, 'parse_mode': 'HTML',
+                          'text': (f"🤖 <b>ML Update #{db['learn_count']}</b>\n"
+                                   f"Trades: {total} | WR: {wins/max(total,1)*100:.0f}%\n"
+                                   f"Min score: {db['weights'].get('learned_min_score', 6.5)}\n\n"
+                                   + "\n".join(changes[:8]))},
+                    timeout=8)
+            except: pass
 
     save_db(db)
     return changes
@@ -352,10 +401,16 @@ def compute_learned_score(setup, tags, session, weekly, rsi_val, base_score):
 
     return round(min(10, score), 1)
 
-def get_min_score(session):
-    """Dynamic minimum score threshold based on session"""
+def get_min_score(session, setup=None):
+    """Dynamic minimum score — ML adjusts this based on real WR"""
     db = load_db()
-    return db['weights']['min_score_session'].get(session, 6.5)
+    # Base: learned global threshold (raises if WR is poor)
+    base = db['weights'].get('learned_min_score',
+           db['weights'].get('min_score_session', {}).get(session, 6.5))
+    # Per-setup override (raised for consistently losing setups)
+    if setup and setup in db['weights'].get('min_score_by_setup', {}):
+        base = max(base, db['weights']['min_score_by_setup'][setup])
+    return round(base, 1)
 
 # ── HELPERS ──────────────────────────────────────────────────────────
 def get_rsi_zone(rsi):
@@ -375,6 +430,16 @@ def get_session():
     return 'Asian'
 
 # ── PERFORMANCE REPORT ───────────────────────────────────────────────
+def _get_setup_wr(setup):
+    """Quick lookup of win rate for a setup — used in ML debug logging"""
+    try:
+        db = load_db()
+        s = db['stats']['by_setup'].get(setup, {})
+        total = s.get('total', 0)
+        if total < 3: return '?%'
+        return f"{s['w']/total*100:.0f}%"
+    except: return '?%'
+
 def performance_report():
     db = load_db()
     s = db['stats']
@@ -990,7 +1055,7 @@ TG_TOKEN   = os.environ.get('TG_TOKEN', '')
 TG_CHAT    = os.environ.get('TG_CHAT', '')
 MIN_SCORE  = int(os.environ.get('MIN_SCORE', '6'))
 SCAN_EVERY = int(os.environ.get('SCAN_EVERY_MIN', '1'))
-COOLDOWN_M = int(os.environ.get('COOLDOWN_MIN', '60'))  # min 60min between same-coin signals
+COOLDOWN_M = int(os.environ.get('COOLDOWN_MIN', '30'))
 PORT       = int(os.environ.get('PORT', '8080'))
 
 PAIRS = [
@@ -1345,6 +1410,438 @@ def structure_sl(sh, sl_sw, i, direction, atr_v, swept=None, ob=None,
         if rh: lvls.append(max(p for _,p in rh) + buf)
         return max(lvls) if lvls else None
 
+# ══════════════════════════════════════════════════
+# ADAPTIVE STRATEGY ENGINE
+# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE STRATEGY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+"""
+Three-layer adaptive system:
+
+Layer 1 — Market Regime Detection
+  Reads current candles every scan, classifies:
+  TRENDING_BULL / TRENDING_BEAR / RANGING / VOLATILE / QUIET
+  Each regime has its own strategy profile.
+
+Layer 2 — Condition Mining (Pattern Discovery)
+  After every trade closes, mines ALL tag/session/rsi/weekly combinations
+  from the trade history to find what ACTUALLY works.
+  Doesn't care about named setups — only what conditions correlate with wins.
+  Discovered patterns boost/suppress signals automatically.
+
+Layer 3 — Strategy Evolution
+  Weights shift toward discovered patterns, away from losing ones.
+  New "virtual setups" emerge from combinations:
+  e.g. "RSI<35 + London + Vol++ + Sweep" becomes its own tracked pattern
+  with its own threshold — even if it wasn't coded as a setup.
+"""
+
+# ── REGIME DETECTION ──────────────────────────────────────────────────────────
+REGIME_STRATEGIES = {
+    'TRENDING_BULL': {
+        'description':    'Strong uptrend — follow momentum',
+        'bias':           'BUY',
+        'prefer_setups':  ['SWEEP_OB', 'BOS', 'HTF_CONFLUENCE'],
+        'avoid_setups':   ['CHOCH'],  # reversals unreliable in strong trends
+        'score_boost':    {'SWEEP_OB':+0.8, 'BOS':+0.5, 'HTF_CONFLUENCE':+0.6},
+        'score_penalty':  {'CHOCH':-1.5},
+        'min_score_mult': 1.0,
+        'sl_mult':        1.0,
+        'tp_mult':        1.2,   # let winners run in trends
+    },
+    'TRENDING_BEAR': {
+        'description':    'Strong downtrend — follow momentum',
+        'bias':           'SELL',
+        'prefer_setups':  ['SWEEP_OB', 'BOS', 'HTF_CONFLUENCE'],
+        'avoid_setups':   ['CHOCH'],
+        'score_boost':    {'SWEEP_OB':+0.8, 'BOS':+0.5, 'HTF_CONFLUENCE':+0.6},
+        'score_penalty':  {'CHOCH':-1.5},
+        'min_score_mult': 1.0,
+        'sl_mult':        1.0,
+        'tp_mult':        1.2,
+    },
+    'RANGING': {
+        'description':    'Sideways — mean reversion favored',
+        'bias':           'NEUTRAL',
+        'prefer_setups':  ['CHOCH'],   # reversals work in ranges
+        'avoid_setups':   ['BOS'],     # BOS fails in ranges (false breaks)
+        'score_boost':    {'CHOCH':+0.5},
+        'score_penalty':  {'BOS':-2.0, 'HTF_CONFLUENCE':-0.5},
+        'min_score_mult': 1.1,  # require more confluence in ranges
+        'sl_mult':        0.8,  # tighter SL in ranges
+        'tp_mult':        0.8,  # faster TP in ranges
+    },
+    'VOLATILE': {
+        'description':    'High volatility — strong setups only',
+        'bias':           'NEUTRAL',
+        'prefer_setups':  ['SWEEP_OB'],  # best setup for volatile moves
+        'avoid_setups':   [],
+        'score_boost':    {'SWEEP_OB':+0.5},
+        'score_penalty':  {},
+        'min_score_mult': 1.2,  # require higher score in volatile markets
+        'sl_mult':        1.3,  # wider SL (more noise)
+        'tp_mult':        1.1,
+    },
+    'QUIET': {
+        'description':    'Low volatility — skip or require A+ setup',
+        'bias':           'SKIP',       # usually skip quiet markets
+        'prefer_setups':  [],
+        'avoid_setups':   [],
+        'score_boost':    {},
+        'score_penalty':  {},
+        'min_score_mult': 1.4,  # very high threshold in quiet markets
+        'sl_mult':        1.0,
+        'tp_mult':        0.9,
+    },
+}
+
+def detect_market_regime(kl, atr_a, closes):
+    """
+    Detect current market regime from candle data.
+    Returns regime name and confidence score.
+    Uses: ATR trend, EMA alignment, price momentum, candle structure.
+    """
+    if len(kl) < 50 or not atr_a[len(kl)-1]: return 'TRENDING_BULL', 0.5
+
+    i = len(kl)-1
+    at = float(atr_a[i])
+    price = closes[i]
+
+    # ATR percentile: where is current ATR vs last 30 bars?
+    past_atr = [a for a in atr_a[i-30:i] if a]
+    if not past_atr: return 'TRENDING_BULL', 0.5
+    atr_pct = sum(1 for a in past_atr if a < at) / len(past_atr)
+
+    # EMAs for trend direction
+    e9  = ema(closes, 9)[i]
+    e20 = ema(closes, 20)[i]
+    e50 = ema(closes, 50)[i]
+    e200= ema(closes, 200)[i]
+
+    # Price momentum: 20-bar return
+    mom_20 = (closes[i] - closes[i-20]) / closes[i-20] * 100 if i>=20 else 0
+
+    # ATR trend: expanding or contracting?
+    atr_5  = sum(a for a in atr_a[i-5:i]  if a) / 5  if i>=5  else at
+    atr_20 = sum(a for a in atr_a[i-20:i] if a) / 20 if i>=20 else at
+    atr_expanding   = at > atr_20 * 1.10
+    atr_contracting = at < atr_20 * 0.85
+
+    # Candle directional consistency
+    last_8 = kl[i-8:i+1]
+    bull_c = sum(1 for k in last_8 if k['c'] > k['o'])
+    bear_c = len(last_8) - bull_c
+
+    # EMA stack
+    bull_stack = e9 and e20 and e50 and e9 > e20 > e50
+    bear_stack = e9 and e20 and e50 and e9 < e20 < e50
+    e200_bull  = e200 and price > e200
+    e200_bear  = e200 and price < e200
+
+    # ── Decision logic ─────────────────────────────────────────────
+    # VOLATILE: ATR very high and expanding
+    if atr_pct > 0.85 and atr_expanding:
+        return 'VOLATILE', round(atr_pct, 2)
+
+    # QUIET: ATR very low and contracting
+    if atr_pct < 0.20 and atr_contracting:
+        return 'QUIET', round(1-atr_pct, 2)
+
+    # RANGING: ATR contracting, no clear EMA direction, price oscillating
+    if atr_contracting and not bull_stack and not bear_stack:
+        # Check price range over last 20 bars
+        hi_20 = max(k['h'] for k in kl[i-20:i+1])
+        lo_20 = min(k['l'] for k in kl[i-20:i+1])
+        range_vs_atr = (hi_20 - lo_20) / (at * 20)
+        if range_vs_atr < 1.5:
+            return 'RANGING', round(1-range_vs_atr/1.5, 2)
+
+    # TRENDING_BULL: strong bullish signals
+    if (bull_stack and e200_bull and mom_20 > 2.0 and bull_c >= 6):
+        conf = min(0.95, 0.5 + abs(mom_20)/20 + (bull_c-4)/10)
+        return 'TRENDING_BULL', round(conf, 2)
+
+    # TRENDING_BEAR: strong bearish signals
+    if (bear_stack and e200_bear and mom_20 < -2.0 and bear_c >= 6):
+        conf = min(0.95, 0.5 + abs(mom_20)/20 + (bear_c-4)/10)
+        return 'TRENDING_BEAR', round(conf, 2)
+
+    # Moderate trend
+    if bull_stack and mom_20 > 0.5: return 'TRENDING_BULL', 0.55
+    if bear_stack and mom_20 < -0.5: return 'TRENDING_BEAR', 0.55
+
+    return 'RANGING', 0.45  # default to ranging if unclear
+
+
+def apply_regime_to_signal(sig, regime, regime_conf):
+    """
+    Modify signal score and SL/TP based on current market regime.
+    Returns modified signal or None if regime says to skip/avoid this setup.
+    """
+    if regime not in REGIME_STRATEGIES: return sig
+    strat = REGIME_STRATEGIES[regime]
+    sig = dict(sig)
+
+    # Direction filter: in TRENDING markets, only take with-trend signals
+    if strat['bias'] == 'BUY'  and sig['dir'] == 'SELL': return None
+    if strat['bias'] == 'SELL' and sig['dir'] == 'BUY':  return None
+    if strat['bias'] == 'SKIP':                           return None
+
+    setup = sig['setup']
+
+    # Score adjustment for this regime
+    boost   = strat['score_boost'].get(setup, 0)
+    penalty = strat['score_penalty'].get(setup, 0)
+    sig['score'] = round(max(0, min(10, sig['score'] + boost + penalty)), 1)
+
+    # SL/TP adjustment
+    entry = sig['price']
+    risk  = abs(entry - sig['sl'])
+    if risk > 0:
+        new_sl = entry - risk*strat['sl_mult'] if sig['dir']=='BUY' else entry + risk*strat['sl_mult']
+        sig['sl'] = round(new_sl, 8)
+        new_risk  = abs(entry - sig['sl'])
+        sig['tp1'] = round(entry + new_risk*2.0*strat['tp_mult'] if sig['dir']=='BUY'
+                           else entry - new_risk*2.0*strat['tp_mult'], 8)
+        sig['tp']  = round(entry + new_risk*2.5*strat['tp_mult'] if sig['dir']=='BUY'
+                           else entry - new_risk*2.5*strat['tp_mult'], 8)
+        sig['tp3'] = round(entry + new_risk*3.0*strat['tp_mult'] if sig['dir']=='BUY'
+                           else entry - new_risk*3.0*strat['tp_mult'], 8)
+
+    sig['regime']      = regime
+    sig['regime_conf'] = regime_conf
+    sig['regime_desc'] = strat['description']
+    sig['tags']        = list(sig.get('tags',[])) + [f'Regime:{regime}({regime_conf:.0%})']
+    return sig
+
+
+# ── CONDITION MINER (Pattern Discovery) ──────────────────────────────────────
+CONDITION_MINE_FILE = os.environ.get('CONDITION_MINE_FILE', '/data/condition_patterns.json')
+
+def _load_patterns():
+    try:
+        if Path(CONDITION_MINE_FILE).exists():
+            with open(CONDITION_MINE_FILE) as f: return json.load(f)
+    except: pass
+    return {'patterns': {}, 'discovered': [], 'version': 1, 'last_mine': None}
+
+def _save_patterns(db):
+    try:
+        Path(CONDITION_MINE_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(CONDITION_MINE_FILE, 'w') as f: json.dump(db, f, indent=2)
+    except Exception as e: log.debug(f"Pattern save: {e}")
+
+def mine_conditions(trade_db):
+    """
+    After trades close, mine ALL condition combinations to find
+    what actually produces wins — regardless of setup name.
+
+    Tracks patterns like:
+      "session:London + weekly:bullish + RSI:oversold"  → WR 68%
+      "session:Asian + CHOCH"                           → WR 22%
+      "Vol++ + Sweep + London"                          → WR 74%
+
+    These become 'discovered patterns' the engine applies automatically.
+    """
+    outcomes = [s for s in trade_db.get('signals', []) if s.get('result')]
+    if len(outcomes) < 8: return []
+
+    pdb = _load_patterns()
+    patterns = pdb['patterns']
+    discovered = []
+
+    def update_pattern(key, result, pnl):
+        if key not in patterns:
+            patterns[key] = {'w':0,'l':0,'be':0,'total':0,'pnl':0.0}
+        p = patterns[key]
+        p['total'] += 1; p['pnl'] = round(p['pnl'] + pnl, 3)
+        if result=='win': p['w'] += 1
+        elif result=='loss': p['l'] += 1
+        else: p['be'] += 1
+
+    # Mine all trades
+    for trade in outcomes:
+        result = trade.get('result','?')
+        pnl    = trade.get('pnl', 0)
+        sess   = trade.get('session','?')
+        weekly = trade.get('weekly','?')
+        setup  = trade.get('setup','?')
+        rsi_z  = trade.get('rsi_zone','?')
+        tags   = set(trade.get('tags',[]))
+        regime = trade.get('regime','?')
+
+        # Single conditions
+        update_pattern(f"session:{sess}", result, pnl)
+        update_pattern(f"setup:{setup}", result, pnl)
+        update_pattern(f"weekly:{weekly}", result, pnl)
+        update_pattern(f"rsi:{rsi_z}", result, pnl)
+        update_pattern(f"regime:{regime}", result, pnl)
+
+        # Two-way combinations
+        update_pattern(f"session:{sess}+setup:{setup}", result, pnl)
+        update_pattern(f"session:{sess}+weekly:{weekly}", result, pnl)
+        update_pattern(f"setup:{setup}+weekly:{weekly}", result, pnl)
+        update_pattern(f"setup:{setup}+rsi:{rsi_z}", result, pnl)
+        update_pattern(f"regime:{regime}+setup:{setup}", result, pnl)
+
+        # Tag-based patterns
+        for tag in ['Sweep↑','Sweep↓','OB_Retest','Vol✓','Vol++','RSI_Div✓','EMA↑','EMA↓']:
+            if tag in tags:
+                update_pattern(f"tag:{tag}", result, pnl)
+                update_pattern(f"tag:{tag}+session:{sess}", result, pnl)
+                update_pattern(f"tag:{tag}+setup:{setup}", result, pnl)
+
+        # Three-way high-signal combinations
+        update_pattern(f"session:{sess}+setup:{setup}+weekly:{weekly}", result, pnl)
+        if 'Vol++' in tags or 'Vol✓' in tags:
+            update_pattern(f"vol_surge+session:{sess}+setup:{setup}", result, pnl)
+        if 'Sweep↑' in tags or 'Sweep↓' in tags:
+            update_pattern(f"sweep+session:{sess}+weekly:{weekly}", result, pnl)
+
+    # ── Find high-value discovered patterns ────────────────────────
+    new_discoveries = []
+    for key, stats in patterns.items():
+        if stats['total'] < 5: continue  # need at least 5 occurrences
+        wr = stats['w'] / stats['total']
+        avg_pnl = stats['pnl'] / stats['total']
+
+        # Significant winner: WR>60% and positive expected value
+        if wr > 0.60 and avg_pnl > 0.5:
+            disc = {
+                'pattern':    key,
+                'wr':         round(wr, 3),
+                'n':          stats['total'],
+                'avg_pnl':    round(avg_pnl, 3),
+                'boost':      round(min(2.0, (wr - 0.5) * 4), 2),  # up to +2.0 score
+                'type':       'winner',
+                'discovered': datetime.now(timezone.utc).isoformat()[:10],
+            }
+            new_discoveries.append(disc)
+            discovered.append(f"✅ Winner: '{key}' WR:{wr:.0%} n={stats['total']} boost:+{disc['boost']}")
+
+        # Consistent loser: WR<30%
+        elif wr < 0.30 and stats['total'] >= 6:
+            disc = {
+                'pattern':    key,
+                'wr':         round(wr, 3),
+                'n':          stats['total'],
+                'avg_pnl':    round(avg_pnl, 3),
+                'penalty':    round(max(-2.0, (wr - 0.5) * 3), 2),  # up to -1.5 score
+                'type':       'loser',
+                'discovered': datetime.now(timezone.utc).isoformat()[:10],
+            }
+            new_discoveries.append(disc)
+            discovered.append(f"❌ Loser: '{key}' WR:{wr:.0%} n={stats['total']} penalty:{disc['penalty']}")
+
+    pdb['patterns']   = patterns
+    pdb['discovered'] = new_discoveries
+    pdb['last_mine']  = datetime.now(timezone.utc).isoformat()
+    _save_patterns(pdb)
+    return discovered
+
+
+def apply_discovered_patterns(sig, session):
+    """
+    Apply discovered patterns to current signal.
+    Score boost if signal matches a known winning pattern.
+    Score penalty if signal matches a known losing pattern.
+    """
+    pdb = _load_patterns()
+    if not pdb['discovered']: return sig, []
+
+    sig = dict(sig); applied = []
+    tags   = set(sig.get('tags', []))
+    setup  = sig['setup']
+    weekly = sig.get('weekly','neutral')
+    rsi_z  = sig.get('rsi_zone','neutral')
+    regime = sig.get('regime','?')
+
+    # Build condition set for this signal
+    conditions = {
+        f"session:{session}",
+        f"setup:{setup}",
+        f"weekly:{weekly}",
+        f"rsi:{rsi_z}",
+        f"regime:{regime}",
+        f"session:{session}+setup:{setup}",
+        f"session:{session}+weekly:{weekly}",
+        f"setup:{setup}+weekly:{weekly}",
+        f"setup:{setup}+rsi:{rsi_z}",
+        f"regime:{regime}+setup:{setup}",
+        f"session:{session}+setup:{setup}+weekly:{weekly}",
+    }
+    for tag in tags:
+        conditions.add(f"tag:{tag}")
+        conditions.add(f"tag:{tag}+session:{session}")
+        conditions.add(f"tag:{tag}+setup:{setup}")
+    if any(t in tags for t in ['Vol++','Vol✓']):
+        conditions.add(f"vol_surge+session:{session}+setup:{setup}")
+    if any(t in tags for t in ['Sweep↑','Sweep↓']):
+        conditions.add(f"sweep+session:{session}+weekly:{weekly}")
+
+    # Match against discoveries
+    total_adj = 0.0
+    for disc in pdb['discovered']:
+        if disc['pattern'] not in conditions: continue
+        if disc['type'] == 'winner':
+            adj = disc.get('boost', 0.5)
+            total_adj += adj
+            applied.append(f"Pattern+{adj:.1f}: {disc['pattern']}({disc['wr']:.0%})")
+        elif disc['type'] == 'loser':
+            adj = disc.get('penalty', -0.5)
+            total_adj += adj
+            applied.append(f"Pattern{adj:.1f}: {disc['pattern']}({disc['wr']:.0%})")
+
+    if total_adj != 0:
+        sig['score'] = round(max(0, min(10, sig['score'] + total_adj)), 1)
+        sig['tags']  = list(sig.get('tags',[])) + [f'Patterns({total_adj:+.1f})']
+
+    return sig, applied
+
+
+def patterns_report():
+    """TG command /patterns — what has the engine discovered?"""
+    pdb = _load_patterns()
+    disc = pdb.get('discovered', [])
+    total_pats = len(pdb.get('patterns', {}))
+    if not disc:
+        return "🧬 No patterns discovered yet. Need 8+ completed trades."
+
+    winners = [d for d in disc if d['type']=='winner']
+    losers  = [d for d in disc if d['type']=='loser']
+
+    lines = [
+        "🧬 <b>Discovered Patterns</b>",
+        f"Tracking {total_pats} condition combinations",
+        f"Last mined: {pdb.get('last_mine','never')[:10]}",
+        "",
+        f"✅ <b>Winning patterns ({len(winners)}):</b>",
+    ]
+    for d in sorted(winners, key=lambda x:x['wr'], reverse=True)[:5]:
+        lines.append(f"  {d['pattern']} → WR {d['wr']:.0%} (n={d['n']}) boost:+{d.get('boost',0):.1f}")
+
+    lines += ["", f"❌ <b>Losing patterns ({len(losers)}):</b>"]
+    for d in sorted(losers, key=lambda x:x['wr'])[:5]:
+        lines.append(f"  {d['pattern']} → WR {d['wr']:.0%} (n={d['n']}) penalty:{d.get('penalty',0):.1f}")
+
+    lines += ["", f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC | 🧬 SMC Adaptive Engine"]
+    return '\n'.join(lines)
+
+
+def regime_report(kl_by_sym):
+    """Quick TG report of current regime per coin"""
+    if not kl_by_sym: return "📊 No regime data yet."
+    lines = ["📊 <b>Current Market Regimes</b>", ""]
+    icons = {'TRENDING_BULL':'🟢','TRENDING_BEAR':'🔴','RANGING':'🟡','VOLATILE':'🟠','QUIET':'⚪'}
+    for sym, (regime, conf) in kl_by_sym.items():
+        strat = REGIME_STRATEGIES.get(regime, {})
+        icon  = icons.get(regime, '⚫')
+        lines.append(f"{icon} {sym}: {regime} ({conf:.0%}) — {strat.get('description','')}")
+    lines.append(f"\n⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
+    return '\n'.join(lines)
+
+
 # ── SIGNAL DETECTION ───────────────────────────
 def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                ht_a, atr_a, va_a, weekly_b, daily_b):
@@ -1577,16 +2074,14 @@ def compute(kl, pair, kl_btc=None):
     session_on = in_session(hour)
     # We pass this info through but don't hard-block
 
-    # ── HARD LOCK: no new signal while trade is open for this pair ──────
-    # Primary guard — prevents BUY then SELL or duplicate signals
+    # ── HARD LOCK: block if trade already open ─────────────────────
     if pair['sym'] in state['open_trades']:
-        log.debug(f"  {pair['sym']}: trade already open — blocking until TP/SL")
+        log.debug(f"  {pair['sym']}: trade open — blocked by ML hard lock")
         return None
-
-    # ── Cooldown check (secondary guard) ─────────────────────────────
+    # ── Cooldown check ─────────────────────────────────────────────
     lf = last_fired.get(pair['sym'])
     if lf and (time.time()-lf['time'])/60 < COOLDOWN_M:
-        return None  # Still in cooldown for this coin
+        return None
 
     sh, sl = swings(kl, 5)
     weekly_b = calc_bias(kl, i, 21)   # IMPROVEMENT 2: weekly gate
@@ -1597,7 +2092,12 @@ def compute(kl, pair, kl_btc=None):
     # Use learned dynamic score instead of fixed threshold
     session_name = get_session()
     effective_min = get_min_score(session_name)
-    if not sig or sig['score'] < effective_min: return None
+    if not sig: return None
+    if sig['score'] < effective_min:
+        log.debug(f"  ML blocked {pair['sym']} {sig['setup']}: "
+                  f"score {sig['score']:.1f} < threshold {effective_min:.1f} "
+                  f"(session:{session_name} setup_wr:{_get_setup_wr(sig['setup'])})")
+        return None
 
     # Compute learned score (adjusted by historical performance)
     learned_score = compute_learned_score(
@@ -1606,8 +2106,28 @@ def compute(kl, pair, kl_btc=None):
         rsi_a[i] or 50, sig['score']
     )
     sig = dict(sig)
-    sig['raw_score']    = sig['score']   # original score
-    sig['score']        = learned_score  # learned-adjusted score
+    sig['raw_score'] = sig['score']
+    sig['score']     = learned_score
+
+    # ── Layer 1: Market regime filter + adjustment ────────────────────
+    try:
+        regime, regime_conf = detect_market_regime(kl, atr_a, closes)
+        state['regimes'][pair['sym']] = (regime, regime_conf)
+        sig = apply_regime_to_signal(sig, regime, regime_conf)
+        if sig is None:
+            log.debug(f"  {pair['sym']}: signal suppressed by regime ({regime})")
+            return None
+    except Exception as e:
+        log.debug(f"  Regime detection: {e}")
+        regime, regime_conf = 'UNKNOWN', 0.5
+
+    # ── Layer 2: Discovered pattern boost/penalty ─────────────────────
+    try:
+        sig, pat_applied = apply_discovered_patterns(sig, session_name)
+        if pat_applied:
+            log.debug(f"  {pair['sym']}: patterns applied {pat_applied[:2]}")
+    except Exception as e:
+        log.debug(f"  Pattern apply: {e}")
     sig['session_name'] = session_name
 
     # IMPROVEMENT 3: BTC correlation gate
@@ -1929,12 +2449,11 @@ def check_prices():
     for sym, trade in list(state['open_trades'].items()):
         try:
             pair   = next(p for p in PAIRS if p['sym'] == sym)
-            # Fetch candles to get actual high/low range (catches wick SL hits)
             kl_chk = fetch_candles(pair, limit=5)
             if not kl_chk: continue
-            price    = float(kl_chk[-1]['c'])
-            chk_hi   = max(k['h'] for k in kl_chk[-3:])  # candle HIGH
-            chk_lo   = min(k['l'] for k in kl_chk[-3:])  # candle LOW
+            price  = float(kl_chk[-1]['c'])
+            chk_hi = max(k['h'] for k in kl_chk[-3:])
+            chk_lo = min(k['l'] for k in kl_chk[-3:])
             if not price: continue
             is_buy = trade['dir'] == 'BUY'
             entry  = trade['entry']
@@ -2007,7 +2526,6 @@ def check_prices():
                     continue
 
             # SL: LOSS
-            # SL: use candle low for BUY, candle high for SELL (catches wick hits)
             if (is_buy and chk_lo<=sl_p) or (not is_buy and chk_hi>=sl_p):
                 pnl = round(abs(sl_p-entry)/entry*100,2)
                 analysis = _analyze_loss(trade, price)
@@ -2340,6 +2858,10 @@ def main():
                         elif txt == '/reset_weights':
                             db = load_db(); db['weights']=DEFAULT_WEIGHTS.copy(); save_db(db)
                             send_tg("✅ Weights reset to defaults")
+                        elif txt in ('/patterns', '/discover'):
+                            send_tg(patterns_report())
+                        elif txt in ('/regime', '/market'):
+                            send_tg(regime_report(state.get('regimes',{})))
                         elif txt == '/help':
                             send_tg(
                                 "📡 <b>SMC Bot Commands</b>\n\n"
@@ -2348,7 +2870,9 @@ def main():
                                 "/deep    — deep chart analysis report\n"
                                 "/weights — learned weights\n"
                                 "/weekly  — weekly summary\n"
-                                "/open    — open trades\n"
+                                "/open     — open trades\n"
+                                "/regime   — current market regime per coin\n"
+                                "/patterns — what the engine has discovered\n"
                                 "/help    — this menu"
                             )
             except Exception as e:
