@@ -1577,7 +1577,6 @@ def compute(kl, pair, kl_btc=None):
     session_on = in_session(hour)
     # We pass this info through but don't hard-block
 
-<<<<<<< HEAD
     # ── HARD LOCK: no new signal while trade is open for this pair ──────
     # Primary guard — prevents BUY then SELL or duplicate signals
     if pair['sym'] in state['open_trades']:
@@ -1585,9 +1584,6 @@ def compute(kl, pair, kl_btc=None):
         return None
 
     # ── Cooldown check (secondary guard) ─────────────────────────────
-=======
-    # Cooldown check
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
     lf = last_fired.get(pair['sym'])
     if lf and (time.time()-lf['time'])/60 < COOLDOWN_M:
         return None  # Still in cooldown for this coin
@@ -1933,25 +1929,12 @@ def check_prices():
     for sym, trade in list(state['open_trades'].items()):
         try:
             pair   = next(p for p in PAIRS if p['sym'] == sym)
-<<<<<<< HEAD
             # Fetch candles to get actual high/low range (catches wick SL hits)
             kl_chk = fetch_candles(pair, limit=5)
             if not kl_chk: continue
             price    = float(kl_chk[-1]['c'])
             chk_hi   = max(k['h'] for k in kl_chk[-3:])  # candle HIGH
             chk_lo   = min(k['l'] for k in kl_chk[-3:])  # candle LOW
-=======
-            # ── Fetch recent candle high/low not just spot price ──────────
-            # Using last 3 x 1h candles to get the actual range price traded
-            # This catches SL/TP hits that happened between 60s checks
-            kl_check = fetch_candles(pair, limit=5)
-            if not kl_check: continue
-            # Use last candle's close for current price
-            price     = float(kl_check[-1]['c'])
-            # Use recent high/low to detect if SL/TP was touched
-            recent_hi = max(k['h'] for k in kl_check[-3:])
-            recent_lo = min(k['l'] for k in kl_check[-3:])
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
             if not price: continue
             is_buy = trade['dir'] == 'BUY'
             entry  = trade['entry']
@@ -1959,20 +1942,10 @@ def check_prices():
             tp1_p  = trade['tp1']
             tp2_p  = trade['tp']
             tp3_p  = trade.get('tp3', tp2_p)
-<<<<<<< HEAD
 
             # TP1: Breakeven
             if not trade.get('be_triggered'):
                 if (is_buy and chk_hi>=tp1_p) or (not is_buy and chk_lo<=tp1_p):
-=======
-            # For SL/TP checks use candle range, not just last price
-            check_hi = recent_hi  # did price reach this high?
-            check_lo = recent_lo  # did price reach this low?
-
-            # TP1: Breakeven
-            if not trade.get('be_triggered'):
-                if (is_buy and check_hi>=tp1_p) or (not is_buy and check_lo<=tp1_p):
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
                     trade['be_triggered'] = True
                     pnl1 = round(abs(tp1_p-entry)/entry*100,2)
                     send_tg(
@@ -1988,11 +1961,7 @@ def check_prices():
 
             # TP2: WIN
             if not trade.get('tp2_hit'):
-<<<<<<< HEAD
                 if (is_buy and chk_hi>=tp2_p) or (not is_buy and chk_lo<=tp2_p):
-=======
-                if (is_buy and check_hi>=tp2_p) or (not is_buy and check_lo<=tp2_p):
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
                     trade['tp2_hit'] = True
                     pnl = round(abs(tp2_p-entry)/entry*100,2)
                     analysis = _analyze_win(trade)
@@ -2026,11 +1995,7 @@ def check_prices():
 
             # TP3: Runner
             if trade.get('tp2_hit') and not trade.get('tp3_hit'):
-<<<<<<< HEAD
                 if (is_buy and chk_hi>=tp3_p) or (not is_buy and chk_lo<=tp3_p):
-=======
-                if (is_buy and check_hi>=tp3_p) or (not is_buy and check_lo<=tp3_p):
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
                     trade['tp3_hit'] = True
                     pnl = round(abs(tp3_p-entry)/entry*100,2)
                     send_tg(
@@ -2042,24 +2007,16 @@ def check_prices():
                     continue
 
             # SL: LOSS
-<<<<<<< HEAD
             # SL: use candle low for BUY, candle high for SELL (catches wick hits)
             if (is_buy and chk_lo<=sl_p) or (not is_buy and chk_hi>=sl_p):
-=======
-            # SL check uses candle LOW for BUY (did price dip to SL?)
-            # and candle HIGH for SELL (did price spike to SL?)
-            # This is how SL actually gets hit — on wicks, not close prices
-            if (is_buy and check_lo<=sl_p) or (not is_buy and check_hi>=sl_p):
->>>>>>> 93ce519e22959e29c9cd8095b633c1b3851cebfe
                 pnl = round(abs(sl_p-entry)/entry*100,2)
-                exit_p = sl_p  # exact SL price, not spot
-                analysis = _analyze_loss(trade, exit_p)
+                analysis = _analyze_loss(trade, price)
                 send_tg(
                     f"❌ <b>LOSS — {sym}/USD -{pnl}%</b>\n\n"
                     f"📐 Setup: {trade.get('setup_name','—')}\n"
                     f"📊 Score was: {trade.get('score',0)}/10\n\n"
                     f"💰 Entry:  <code>{fp(entry)}</code>\n"
-                    f"🛑 SL hit: <code>{fp(exit_p)}</code>  (-{pnl}%)\n"
+                    f"🛑 SL hit: <code>{fp(price)}</code>  (-{pnl}%)\n"
                     f"⏱ Held: {_hours_held(trade)}\n\n"
                     f"🔍 <b>Failure Analysis:</b>\n{analysis}\n\n"
                     f"📚 <i>Engine is learning from this trade.</i>\n"
