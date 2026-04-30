@@ -2,7 +2,7 @@
 SMC Engine Pro v3 — 24/7 Alert Server
 Railway-compatible | All 5 improvements built in
 
-Improvements over v2: 
+Improvements over v2:
   1. Session filter      — London 07-12 UTC + NY 13-18 UTC only
   2. Weekly bias gate    — never trade against weekly trend
   3. BTC correlation     — suppress altcoin signals against BTC direction
