@@ -156,6 +156,9 @@ def log_signal(sig, pair, session):
         'tp2':          sig['tp'],
         'tp3':          sig['tp3'],
         'rr':           sig['rr'],
+        'tp_mode':      sig.get('tp_mode','STRUCTURE'),
+        'regime':       sig.get('regime','UNKNOWN'),
+        'regime_conf':  sig.get('regime_conf', 0.5),
         'risk_pct':     sig['risk_pct'],
         'tags':         sig.get('tags', []),
         'session':      session,
@@ -221,15 +224,15 @@ def close_trade(trade_id, result, exit_price, bars_held=0):
     db['outcomes'].append(sig)
     save_db(db)
 
-    # Auto-learn after every 5 trades
+    # Learn after EVERY trade (fast ML)
     total = db['stats']['total_trades']
-    if total >= 5 and total % 5 == 0:
-        learn(db)
-        # Also mine condition patterns
+    learn(db)  # always learn immediately
+    # Mine patterns every 3 trades
+    if total >= 5 and total % 3 == 0:
         try:
             discoveries = mine_conditions(db)
             if discoveries:
-                log.info(f"  🧬 Pattern mining: {len(discoveries)} patterns found")
+                log.info(f"  🧬 {len(discoveries)} patterns discovered")
         except Exception as e:
             log.debug(f"Pattern mining: {e}")
 
@@ -255,9 +258,12 @@ def learn(db):
     if len(outcomes) < 5:
         return  # not enough data
 
-    # Learning rate: more aggressive when clear pattern (many trades)
+    # Dynamic LR: fast early learning, stable when mature
     n_trades = len(outcomes)
-    lr = min(0.35, 0.15 + (n_trades / 100) * 0.2)  # grows 0.15→0.35 as data accumulates
+    if n_trades < 10:   lr = 0.40   # very fast — few trades, learn hard
+    elif n_trades < 25: lr = 0.30   # fast
+    elif n_trades < 50: lr = 0.20   # medium
+    else:               lr = 0.12   # stable — enough data, don't overfit
     changes = []
 
     # ── Learn setup scores (Bayesian update toward actual WR) ───────
@@ -278,6 +284,21 @@ def learn(db):
             # This setup keeps losing — raise its personal threshold
             db['weights'].setdefault('min_score_by_setup', {})[setup] = round(min(9.0, current_score + 1.0), 1)
             changes.append(f"⚠ {setup}: raising threshold to {db['weights']['min_score_by_setup'][setup]}")
+
+    # ── Learn TP mode performance (fixed vs structure) ─────────────────
+    for mode, grp in [
+        ('FIXED_TREND',  [s for s in outcomes if 'FIXED_TREND'  in s.get('tp_mode','')]),
+        ('FIXED_RANGE',  [s for s in outcomes if 'FIXED_RANGE'  in s.get('tp_mode','')]),
+        ('FIXED_VOLATILE',[s for s in outcomes if 'FIXED_VOLATILE' in s.get('tp_mode','')]),
+        ('STRUCTURE',    [s for s in outcomes if s.get('tp_mode','STRUCTURE')=='STRUCTURE']),
+    ]:
+        if len(grp) < 3: continue
+        wr  = sum(1 for t in grp if t['result']=='win') / len(grp)
+        pnl = sum(t.get('pnl',0) for t in grp) / len(grp)
+        db['stats'].setdefault('by_tp_mode', {})[mode] = {
+            'n': len(grp), 'wr': round(wr,3), 'avg_pnl': round(pnl,3)
+        }
+        changes.append(f"TP mode {mode}: WR {wr:.0%} n={len(grp)} pnl={pnl:+.2f}%")
 
     # ── Learn tag effectiveness ──────────────────────────────────────
     for tag, stats in db['stats']['by_tag'].items():
@@ -356,7 +377,9 @@ def learn(db):
         db['learning_log'].append(log_entry)
         db['last_learned'] = log_entry['time']
         # Send TG notification every 3rd cycle so you can see ML decisions
-        if db['learn_count'] % 3 == 0 and TG_TOKEN and TG_CHAT:
+        # Notify every cycle when few trades, every 3rd when mature
+        _n = db['stats']['total_trades']
+        if (_n < 20 or db['learn_count'] % 3 == 0) and TG_TOKEN and TG_CHAT:
             try:
                 import requests as _rq
                 _rq.post(
@@ -2201,16 +2224,62 @@ def compute(kl, pair, kl_btc=None):
     risk = abs(price - sl_p)
     if risk <= 0: return None
 
-    rr_mult = 3.0 if sig['setup'] == 'SWEEP_OB' else 2.5
-    tp_p    = price + risk*rr_mult if is_buy else price - risk*rr_mult
-    tp1_p   = price + risk*2.0    if is_buy else price - risk*2.0
-    tp3_p   = price + risk*3.0    if is_buy else price - risk*3.0
-    rr      = abs(tp_p - price)/risk
-    if rr < 2.0: return None
+    # ── Regime-Aware TP/SL Selection ────────────────────────────────────────
+    # Backtest results:
+    #   TRENDING: 2%SL/6%TP (1:3) → PF 2.37 ★
+    #   RANGING:  1.5%SL/4.5%TP (1:3) → PF 2.02 ✅
+    #   STRUCTURE: baseline → PF 1.87
+    regime      = sig.get('regime', 'UNKNOWN')
+    regime_conf = sig.get('regime_conf', 0.5)
+
+    if regime in ('TRENDING_BULL','TRENDING_BEAR') and regime_conf >= 0.55:
+        # Fixed 2% SL / 6% TP — let it run in the trend
+        sl_pct  = float(os.environ.get('TREND_SL_PCT', '0.02'))
+        tp_pct  = float(os.environ.get('TREND_TP_PCT', '0.06'))
+        sl_p    = price*(1-sl_pct) if is_buy else price*(1+sl_pct)
+        risk    = abs(price-sl_p)
+        tp_p    = price*(1+tp_pct)     if is_buy else price*(1-tp_pct)
+        tp1_p   = price*(1+tp_pct*0.5) if is_buy else price*(1-tp_pct*0.5)
+        tp3_p   = price*(1+tp_pct*1.5) if is_buy else price*(1-tp_pct*1.5)
+        rr      = tp_pct/sl_pct
+        tp_mode = f'TREND({sl_pct*100:.0f}%SL/{tp_pct*100:.0f}%TP)'
+
+    elif regime == 'RANGING':
+        # Fixed 1.5% SL / 4.5% TP — tighter, faster in range
+        sl_pct  = float(os.environ.get('RANGE_SL_PCT', '0.015'))
+        tp_pct  = float(os.environ.get('RANGE_TP_PCT', '0.045'))
+        sl_p    = price*(1-sl_pct) if is_buy else price*(1+sl_pct)
+        risk    = abs(price-sl_p)
+        tp_p    = price*(1+tp_pct)     if is_buy else price*(1-tp_pct)
+        tp1_p   = price*(1+tp_pct*0.4) if is_buy else price*(1-tp_pct*0.4)
+        tp3_p   = price*(1+tp_pct*1.3) if is_buy else price*(1-tp_pct*1.3)
+        rr      = tp_pct/sl_pct
+        tp_mode = f'RANGE({sl_pct*100:.0f}%SL/{tp_pct*100:.0f}%TP)'
+
+    elif regime == 'VOLATILE':
+        # Wider 2.5% SL / 6% TP — need room
+        sl_p    = price*0.975 if is_buy else price*1.025
+        risk    = abs(price-sl_p)
+        tp_p    = price*1.06  if is_buy else price*0.94
+        tp1_p   = price*1.03  if is_buy else price*0.97
+        tp3_p   = price*1.09  if is_buy else price*0.91
+        rr      = 2.4
+        tp_mode = 'VOLATILE(2.5%SL/6%TP)'
+
+    else:
+        # QUIET or UNKNOWN — stick with structure-based
+        rr_mult = 3.0 if sig['setup'] == 'SWEEP_OB' else 2.5
+        tp_p    = price + risk*rr_mult if is_buy else price - risk*rr_mult
+        tp1_p   = price + risk*2.0    if is_buy else price - risk*2.0
+        tp3_p   = price + risk*3.0    if is_buy else price - risk*3.0
+        rr      = abs(tp_p - price)/risk
+        tp_mode = 'STRUCTURE'
+
+    if rr < 1.5: return None  # minimum 1:1.5 ratio
 
     conf = min(97, int(sig['score']*8.5 + min(rr,3)*2.5))
 
-    return {**sig, 'price': price, 'sl': sl_p, 'tp': tp_p,
+    return {**sig, 'price': price, 'sl': sl_p, 'tp': tp_p, 'tp_mode': tp_mode,
             'tp1': tp1_p, 'tp3': tp3_p, 'rr': round(rr,2),
             'conf': conf, 'weekly': weekly_b, 'daily': daily_b,
             'rsi_val': round(rsi_a[i]),
@@ -2696,6 +2765,20 @@ def run_scan():
     state['scans_done'] += 1
     state['last_scan'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     log.info(f"Scan #{state['scans_done']} — {len(PAIRS)} pairs")
+
+    # ── Update regime for ALL pairs every scan (not just when signal fires) ──
+    for _pair in PAIRS:
+        try:
+            _kl = fetch_candles(_pair, limit=100)
+            if _kl and len(_kl) >= 50:
+                _closes = [k['c'] for k in _kl]
+                _atr_a  = calc_atr(_kl)
+                _r, _rc = detect_market_regime(_kl, _atr_a, _closes)
+                state['regimes'][_pair['sym']] = (_r, _rc)
+        except Exception as _e:
+            log.debug(f"Regime {_pair['sym']}: {_e}")
+        time.sleep(0.2)
+    log.info(f"  Regimes: { {s:r[0][:4] for s,(r,_) in state['regimes'].items()} }")
     if check_circuit_breaker():
         log.warning("Circuit breaker active — skipping scan"); return
     kl_btc = None
