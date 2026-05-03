@@ -2021,6 +2021,7 @@ last_fired = {}
 def compute(kl, pair, kl_btc=None):
     if len(kl) < 80: return None
     i = len(kl)-1
+    session_name = get_session()  # set early — used throughout
     closes = [k['c'] for k in kl]; vols = [k['v'] for k in kl]
     rsi_a  = rsi(closes); e9_a = ema(closes,9)
     e20_a  = ema(closes,20); e50_a = ema(closes,50)
