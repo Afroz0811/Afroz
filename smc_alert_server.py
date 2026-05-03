@@ -362,10 +362,22 @@ def compute_learned_score(setup, tags, session, weekly, rsi_val, base_score):
 
     return round(min(10, score), 1)
 
-def get_min_score(session):
-    """Dynamic minimum score threshold based on session"""
+def get_min_score(session, setup=None):
+    """Dynamic minimum score — ML adjusts based on real WR"""
     db = load_db()
-    return db['weights']['min_score_session'].get(session, 6.5)
+    base = db['weights'].get('learned_min_score',
+           db['weights'].get('min_score_session', {}).get(session, MIN_SCORE))
+    if setup and setup in db['weights'].get('min_score_by_setup', {}):
+        base = max(base, db['weights']['min_score_by_setup'][setup])
+    # Emergency block: 0% WR after 3+ trades → require near-perfect score
+    by_setup = db['stats'].get('by_setup', {})
+    if setup and setup in by_setup:
+        s = by_setup[setup]
+        if s.get('total', 0) >= 3 and s.get('w', 0) == 0:
+            base = max(base, 9.5)
+        elif s.get('total', 0) >= 5 and s.get('w', 0) / s['total'] < 0.25:
+            base = max(base, 8.5)
+    return round(float(base), 1)
 
 # ── HELPERS ──────────────────────────────────────────────────────────
 def get_rsi_zone(rsi):
