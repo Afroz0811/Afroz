@@ -998,7 +998,7 @@ log = logging.getLogger(__name__)
 # ── CONFIG ─────────────────────────────────────
 TG_TOKEN   = os.environ.get('TG_TOKEN', '')
 TG_CHAT    = os.environ.get('TG_CHAT', '')
-MIN_SCORE  = int(os.environ.get('MIN_SCORE', '4.5'))
+MIN_SCORE         = float(os.environ.get('MIN_SCORE', '4.5'))
 SCAN_EVERY = int(os.environ.get('SCAN_EVERY_MIN', '1'))
 COOLDOWN_M = int(os.environ.get('COOLDOWN_MIN', '15'))
 PORT       = int(os.environ.get('PORT', '8080'))
