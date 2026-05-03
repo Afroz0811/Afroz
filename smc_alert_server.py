@@ -2084,8 +2084,8 @@ def compute(kl, pair, kl_btc=None):
         effective_min = min(effective_min, paper_min)
 
     if not sig or sig['score'] < effective_min:
-        log.debug(f"  {pair['sym']}: score {sig['score'] if sig else '?':.1f} "
-                  f"< {effective_min:.1f} — blocked")
+        sc_str = f"{sig['score']:.1f}" if sig else '?'
+        log.debug(f"  {pair['sym']}: score {sc_str} < {effective_min:.1f} — blocked")
         return None
 
     # Compute learned score (adjusted by historical performance)
@@ -2095,9 +2095,14 @@ def compute(kl, pair, kl_btc=None):
         rsi_a[i] or 50, sig['score']
     )
     sig = dict(sig)
-    sig['raw_score']    = sig['score']   # original score
-    sig['score']        = learned_score  # learned-adjusted score
+    sig['raw_score']    = float(sig['score'])
+    sig['score']        = float(learned_score)
     sig['session_name'] = session_name
+    # Ensure all numeric fields are proper types (not strings)
+    for _fld in ('rr','conf','risk_pct','rew_pct','atr_v','rsi_val'):
+        if _fld in sig and sig[_fld] is not None:
+            try: sig[_fld] = float(sig[_fld])
+            except: sig[_fld] = 0.0
 
     # IMPROVEMENT 3: BTC correlation gate
     if pair['sym'] != 'BTC' and kl_btc:
@@ -2715,7 +2720,13 @@ def run_scan():
                 log.info(f"  {pair['sym']}: no setup")
             time.sleep(0.8)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            # Get last 3 lines of traceback for context
+            tb_lines = [l.strip() for l in tb.splitlines() if l.strip()]
             log.error(f"  {pair['sym']} error: {e}")
+            for tl in tb_lines[-4:]:
+                log.error(f"    {tl}")
     log.info(f"Scan done. Alerts: {state['alerts_sent']}")
 
 def main():
