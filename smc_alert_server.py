@@ -350,8 +350,9 @@ def compute_learned_score(setup, tags, session, weekly, rsi_val, base_score):
         tag_clean = tag.split('RSI')[0].strip()  # normalize RSI35, RSI42 etc
         score += w['tag_weights'].get(tag_clean, 0.3)
 
-    # Apply session multiplier
-    score *= w['session_weights'].get(session, 1.0)
+    # Session weight already applied in get_signal_v2 as additive
+    # Don't multiply again here - would cause double-penalty
+    # score *= w['session_weights'].get(session, 1.0)  # disabled
 
     # Apply RSI zone multiplier
     zone = get_rsi_zone(rsi_val)
@@ -1400,7 +1401,7 @@ def _check_liquidity_sweep(kl, i, sh, sl_sw, at, va_v):
             wick_depth = (lvl - k['l']) / at
             vol_surge  = k['v'] / va_v
             strength   = min(3.0, wick_depth*0.8 + (vol_surge-1.0)*0.5)
-            if wick_depth > 0.15 and vol_surge > 1.0:
+            if wick_depth > 0.10 and vol_surge > 0.8:
                 return 'BUY', round(strength, 2), k['l']
         # Recent bar swept, now retesting
         elif li < i and li >= i-8:
@@ -1416,7 +1417,7 @@ def _check_liquidity_sweep(kl, i, sh, sl_sw, at, va_v):
             wick_h = (k['h'] - lvl) / at
             vol_surge = k['v'] / va_v
             strength  = min(3.0, wick_h*0.8 + (vol_surge-1.0)*0.5)
-            if wick_h > 0.15 and vol_surge > 1.0:
+            if wick_h > 0.10 and vol_surge > 0.8:
                 return 'SELL', round(strength, 2), k['h']
         elif hi_ < i and hi_ >= i-8:
             sc = next((kl[j] for j in range(hi_, min(hi_+5, i+1))
@@ -1607,20 +1608,17 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     # ── Step 1: Determine direction from sweep (primary trigger) ────────
     sweep_dir, sweep_str, wick_level = _check_liquidity_sweep(kl, i, sh, sl_sw, at, va_v)
 
-    # If no sweep, check for EMA/structure-based direction
+    # If no sweep, try EMA/structure direction (relaxed conditions)
     if not sweep_dir:
-        # Try structure-based direction
         if (e9_a[i] and e20_a[i] and e50_a[i] and
                 e9_a[i] > e20_a[i] > e50_a[i] and
                 ht_a[i] and ht_a[i] > 0 and
-                rsi_a[i] and rsi_a[i] < 55 and
-                daily_b == 'bullish'):
+                rsi_a[i] and rsi_a[i] < 60):
             sweep_dir = 'BUY'; sweep_str = 0
         elif (e9_a[i] and e20_a[i] and e50_a[i] and
                 e9_a[i] < e20_a[i] < e50_a[i] and
                 ht_a[i] and ht_a[i] < 0 and
-                rsi_a[i] and rsi_a[i] > 45 and
-                daily_b == 'bearish'):
+                rsi_a[i] and rsi_a[i] > 40):
             sweep_dir = 'SELL'; sweep_str = 0
         else:
             return None
@@ -1678,9 +1676,9 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     if vwap_str > 0: tags.append('VWAP✓')
     conditions['vwap'] = vwap_str
 
-    # 9. Session
-    sess_str = _check_session_bias(session)
-    score += sess_str * 0.5
+    # 9. Session — additive bonus not multiplier (prevents score collapse)
+    sess_bonus = {'London':0.8,'NY':0.6,'Off':0.0,'Asian':-0.3}.get(session, 0.0)
+    score += sess_bonus
     conditions['session'] = session
 
     # 10. Weekly bias
@@ -1740,7 +1738,9 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         setup_label= '📡 Confluence Signal'
 
     # ── Step 5: Threshold check ──────────────────────────────────────────
-    min_score = get_min_score(session, setup_name)
+    min_score = 3.5  # low threshold — let signals through, ML filters quality
+    paper = os.environ.get('PAPER_MODE','false').lower()=='true'
+    if paper: min_score = 2.5  # even lower in paper mode
     if score < min_score:
         log.debug(f"  Score {score:.1f} < min {min_score} ({setup_name}) — skip")
         return None
@@ -2041,7 +2041,7 @@ def compute(kl, pair, kl_btc=None):
     price  = closes[i]
     if any(x is None for x in [rsi_a[i],e9_a[i],e20_a[i],e50_a[i],atr_a[i],va_a[i]]):
         return None
-    if choppy(atr_a, i) or atr_a[i]/price < 0.002: return None
+    # choppy filter removed — ML handles via score
 
     # Session check — not a hard block, but affects minimum score
     # Outside London/NY: require score >= MIN_SCORE+1 (stricter)
@@ -2069,9 +2069,14 @@ def compute(kl, pair, kl_btc=None):
     weekly_b = calc_bias(kl, i, 21)   # IMPROVEMENT 2: weekly gate
     daily_b  = calc_bias(kl, i, 5)
 
+    # Try new adaptive v2 engine first
     sig = get_signal_v2(kl, sh, sl, i, closes, rsi_a, e9_a, e20_a, e50_a,
                        ht_a, atr_a, va_a, weekly_b, daily_b,
                        session=session_name, kl_btc=kl_btc)
+    # Fallback: original get_signal if v2 finds nothing
+    if sig is None:
+        sig = get_signal(kl, sh, sl, i, closes, rsi_a, e9_a, e20_a, e50_a,
+                         ht_a, atr_a, va_a, weekly_b, daily_b)
     # Use learned dynamic score instead of fixed threshold
     session_name = get_session()
     effective_min = get_min_score(session_name)
