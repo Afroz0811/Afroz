@@ -1648,8 +1648,28 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
 
     direction = sweep_dir
 
-    # ── Step 2: Score all conditions ────────────────────────────────────
+    # ── Step 2: PD/PW/PM level scoring ─────────────────────────────────
+    all_lvls, pd_lvls, pw_lvls, pm_lvls = get_all_levels(kl, i)
+    lvl_boost, lvl_tags, best_level, lvl_conf = score_level_proximity(
+        price, all_lvls, at, sweep_dir)
+    # Also check for confluence zones (PD+PW or PD+PM at same price)
+    conf_zones = check_level_confluence(pd_lvls, pw_lvls, pm_lvls, at)
+    conf_boost = 0
+    for zone in conf_zones:
+        if abs(price - zone['level']) / at < 1.0:
+            if (zone['ltype']=='resistance' and sweep_dir=='SELL') or                (zone['ltype']=='support'    and sweep_dir=='BUY'):
+                conf_boost += zone['strength'] * 0.5
+                lvl_tags.append(f"{zone['tf']}✓")
+
+    # ── Step 3: Score all conditions ────────────────────────────────────
     score = 0.0; tags = []; conditions = {}
+
+    # 0. PD/PW/PM level score (applied first — biggest edge)
+    score += lvl_boost + conf_boost
+    tags.extend(lvl_tags)
+    conditions['level_name']  = best_level or 'none'
+    conditions['level_conf']  = lvl_conf
+    conditions['conf_zones']  = len(conf_zones)
 
     # 1. Sweep quality (primary trigger)
     score += sweep_str * 1.2
@@ -1852,6 +1872,181 @@ def learn_condition_boosts(db):
 
 # ── SIGNAL DETECTION ───────────────────────────
 
+
+# ══════════════════════════════════════════════════════
+# PD / PW / PM LEVEL ENGINE
+# ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PD / PW / PM LEVEL ENGINE
+# Previous Day / Previous Week / Previous Month
+# VAH, VAL, POC, High, Low — all calculated from real candle data
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _vp(candles):
+    """Volume Profile: VAH (70% value area high), VAL, POC from candles"""
+    if not candles or len(candles) < 5: return None
+    lo = min(k['l'] for k in candles)
+    hi = max(k['h'] for k in candles)
+    rng = hi - lo
+    if rng <= 0: return None
+    nb = 30; bsz = rng / nb
+    bkts = [0.0] * nb
+    for k in candles:
+        b = min(int(((k['h']+k['l']+k['c'])/3 - lo) / bsz), nb-1)
+        bkts[b] += k['v']
+    tv = sum(bkts)
+    if tv <= 0: return None
+    poc_b = bkts.index(max(bkts))
+    poc   = lo + (poc_b + 0.5) * bsz
+    tgt = tv * 0.70; cov = bkts[poc_b]; lb_ = poc_b; hb_ = poc_b
+    while cov < tgt:
+        la = bkts[lb_-1] if lb_ > 0 else 0
+        ha = bkts[hb_+1] if hb_ < nb-1 else 0
+        if la >= ha and lb_ > 0: lb_ -= 1; cov += la
+        elif hb_ < nb-1: hb_ += 1; cov += ha
+        else: break
+    return {
+        'high': hi, 'low': lo, 'poc': poc,
+        'vah':  lo + (hb_+1)*bsz,
+        'val':  lo + lb_*bsz,
+    }
+
+def get_pd_levels(kl, i):
+    """Previous Day — last 24 candles before current session"""
+    if i < 48: return None
+    v = _vp(kl[i-48:i-24])
+    if not v: return None
+    return {
+        'PDH':   v['high'], 'PDL':  v['low'],
+        'PDVAH': v['vah'],  'PDVAL':v['val'], 'PDPOC':v['poc'],
+    }
+
+def get_pw_levels(kl, i):
+    """Previous Week — 168 candles before last week"""
+    if i < 336: return None
+    v = _vp(kl[i-336:i-168])
+    if not v: return None
+    return {
+        'PWH':   v['high'], 'PWL':  v['low'],
+        'PWVAH': v['vah'],  'PWVAL':v['val'], 'PWPOC':v['poc'],
+    }
+
+def get_pm_levels(kl, i):
+    """Previous Month — 720 candles before last month"""
+    if i < 1440: return None
+    v = _vp(kl[i-1440:i-720])
+    if not v: return None
+    return {
+        'PMH':   v['high'], 'PML':  v['low'],
+        'PMVAH': v['vah'],  'PMVAL':v['val'], 'PMPOC':v['poc'],
+    }
+
+def get_all_levels(kl, i):
+    """Get all PD/PW/PM levels at bar i"""
+    levels = {}
+    pd = get_pd_levels(kl, i)
+    pw = get_pw_levels(kl, i)
+    pm = get_pm_levels(kl, i)
+    if pd: levels.update(pd)
+    if pw: levels.update(pw)
+    if pm: levels.update(pm)
+    return levels, pd, pw, pm
+
+def score_level_proximity(price, levels, atr, direction):
+    """
+    Score how well current price aligns with PD/PW/PM levels.
+    Returns (score_boost, level_tags, best_level_name, confluence_count)
+
+    Logic:
+    - Price at a resistance level + SELL signal = strong confluence
+    - Price at a support level + BUY signal = strong confluence
+    - Multiple timeframe levels at same price = highest conviction
+    - VAH/PDH = resistance, VAL/PDL = support, POC = neutral (context dependent)
+    """
+    if not levels or not atr: return 0, [], None, 0
+
+    tol = 0.8  # within 0.8 ATR = "at the level"
+    hits = []
+
+    for name, lvl in levels.items():
+        if not lvl or abs(price - lvl) / atr > tol:
+            continue
+
+        # Classify level type
+        if any(x in name for x in ('VAH','H')):
+            ltype = 'resistance'
+        elif any(x in name for x in ('VAL','L')):
+            ltype = 'support'
+        else:
+            ltype = 'neutral'  # POC
+
+        # Timeframe weight: PM > PW > PD
+        tf_w = 1.6 if name.startswith('PM') else (1.3 if name.startswith('PW') else 1.0)
+
+        # Direction alignment
+        if ltype == 'resistance' and direction == 'SELL': aligned = True
+        elif ltype == 'support'  and direction == 'BUY':  aligned = True
+        elif ltype == 'neutral':                           aligned = True
+        else:                                              aligned = False
+
+        hits.append((name, lvl, ltype, tf_w, aligned))
+
+    if not hits: return 0, [], None, 0
+
+    # Sort by timeframe weight descending
+    hits.sort(key=lambda x: x[3], reverse=True)
+
+    # Calculate score boost
+    score = 0; tags = []; aligned_count = 0; total_count = len(hits)
+
+    for name, lvl, ltype, tf_w, aligned in hits:
+        if aligned:
+            score += 1.2 * tf_w  # aligned = big boost
+            aligned_count += 1
+        else:
+            score -= 0.5          # against level = penalty
+        tags.append(f'{name}✓' if aligned else f'{name}✗')
+
+    # Confluence bonus: multiple levels at same price
+    if aligned_count >= 2: score += 1.5; tags.append('MultiTF✓')
+    if aligned_count >= 3: score += 1.0; tags.append('TripleTF✓')
+
+    # Cap boost
+    score = round(min(score, 5.0), 1)
+
+    best = hits[0][0]  # highest TF level
+    return score, tags[:4], best, aligned_count
+
+def check_level_confluence(pd, pw, pm, atr):
+    """
+    Find PD levels that coincide with PW or PM levels.
+    These are the HIGHEST CONVICTION zones (seen on your chart as clusters).
+    Returns list of confluence zones.
+    """
+    if not pd: return []
+    zones = []
+    higher = {}
+    if pw: higher.update(pw)
+    if pm: higher.update(pm)
+
+    for pd_name, pd_val in pd.items():
+        if not pd_val: continue
+        for h_name, h_val in higher.items():
+            if not h_val: continue
+            if abs(pd_val - h_val) / max(pd_val, 1) < 0.005:  # within 0.5%
+                # Classify
+                if any(x in pd_name for x in ('VAH','H')): ltype = 'resistance'
+                elif any(x in pd_name for x in ('VAL','L')): ltype = 'support'
+                else: ltype = 'neutral'
+                tf = 'PM+PD' if h_name.startswith('PM') else 'PW+PD'
+                zones.append({
+                    'level': pd_val, 'ltype': ltype,
+                    'pd_name': pd_name, 'h_name': h_name,
+                    'tf': tf, 'strength': 3 if 'PM' in tf else 2,
+                })
+    return sorted(zones, key=lambda x: x['strength'], reverse=True)
+
+
 def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                ht_a, atr_a, va_a, weekly_b, daily_b):
     """
@@ -1869,6 +2064,19 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     price = closes[i]; k = kl[i]
     at = atr_a[i]; va_v = va_a[i]
     if not at or not va_v or not rsi_a[i]: return None
+
+    # ── PD/PW/PM levels — computed once, used in all setups ──────────
+    _all_lvls, _pd, _pw, _pm = get_all_levels(kl, i)
+    _conf_zones = check_level_confluence(_pd, _pw, _pm, at)
+
+    def _level_score(direction):
+        b, t, n, _ = score_level_proximity(price, _all_lvls, at, direction)
+        # Add confluence zone bonus
+        for z in _conf_zones:
+            if abs(price - z['level']) / at < 1.0:
+                if (z['ltype']=='resistance' and direction=='SELL') or                    (z['ltype']=='support'    and direction=='BUY'):
+                    b += z['strength'] * 0.5; t.append(f"{z['tf']}✓")
+        return b, t, n
 
     # ── HTF DIRECTION — applies to ALL setups ────────────────────────
     if weekly_b == 'bullish':
@@ -1904,9 +2112,12 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         score = 8.5 + (0.5 if daily_ok else 0) + (0.5 if k['v'] > va_v*1.3 else 0)
         tags = ['Sweep✓', 'OB✓', 'HTF✓']
         if daily_ok: tags.append('Daily✓')
+        _lb, _lt, _ln = _level_score('BUY')
+        score += _lb; tags.extend(_lt)
         return {'dir':'BUY','setup':'SWEEP_OB','name':'⚡ Sweep + OB Retest',
                 'score':score,'tags':tags,'swept':lvl,'ob':ob,'sl_raw':sl_p,
-                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i])}
+                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i]),
+                'level_name':_ln}
 
     for hi_, lvl in [(ix, float(p)) for ix, p in sh if i-15 < ix < i][-5:]:
         if 'SELL' not in allowed: break
@@ -1926,9 +2137,12 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         score = 8.5 + (0.5 if daily_ok else 0) + (0.5 if k['v'] > va_v*1.3 else 0)
         tags = ['Sweep✓', 'OB✓', 'HTF✓']
         if daily_ok: tags.append('Daily✓')
+        _lb, _lt, _ln = _level_score('SELL')
+        score += _lb; tags.extend(_lt)
         return {'dir':'SELL','setup':'SWEEP_OB','name':'⚡ Sweep + OB Retest',
                 'score':score,'tags':tags,'swept':lvl,'ob':ob,'sl_raw':sl_p,
-                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i])}
+                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i]),
+                'level_name':_ln}
 
     # ── SETUP 2: EMA PULLBACK (strong trend continuation) ────────────
     # Simple but highly effective: trend is clear, price pulls to EMA9/20, bounces
@@ -3026,4 +3240,4 @@ def main():
         time.sleep(SCAN_EVERY * 60)
 
 if __name__ == '__main__':
-    main()  
+    main()
