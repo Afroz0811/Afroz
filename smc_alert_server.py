@@ -1661,6 +1661,10 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                 conf_boost += zone['strength'] * 0.5
                 lvl_tags.append(f"{zone['tf']}✓")
 
+    # ── Step 2b: Fibonacci confluence ───────────────────────────────────
+    fib_boost, fib_tags, fib_levels_dict, fib_ctx = get_fib_context(
+        kl, i, all_lvls, at, sweep_dir)
+
     # ── Step 3: Score all conditions ────────────────────────────────────
     score = 0.0; tags = []; conditions = {}
 
@@ -1670,6 +1674,11 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     conditions['level_name']  = best_level or 'none'
     conditions['level_conf']  = lvl_conf
     conditions['conf_zones']  = len(conf_zones)
+
+    # 0b. Fibonacci confluence (Fib + PD/PW/PM = highest conviction)
+    score += fib_boost
+    tags.extend(fib_tags)
+    conditions['fib_boost'] = fib_boost
 
     # 1. Sweep quality (primary trigger)
     score += sweep_str * 1.2
@@ -2047,6 +2056,150 @@ def check_level_confluence(pd, pw, pm, atr):
     return sorted(zones, key=lambda x: x['strength'], reverse=True)
 
 
+
+# ══════════════════════════════════════════════════════
+# FIBONACCI CONFLUENCE ENGINE
+# ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# FIBONACCI CONFLUENCE ENGINE
+# Auto-detects swing high/low, calculates retracement levels,
+# scores confluence with PD/PW/PM levels
+# ══════════════════════════════════════════════════════════════════════════════
+
+FIB_LEVELS = [0.0, 0.236, 0.382, 0.5, 0.618, 0.65, 0.786, 1.0]
+FIB_NAMES  = {0.0:'Fib0', 0.236:'Fib236', 0.382:'Fib382',
+              0.5:'Fib50', 0.618:'Fib618', 0.65:'Fib65',
+              0.786:'Fib786', 1.0:'Fib100'}
+
+# Most important Fibonacci levels for trading
+FIB_WEIGHTS = {
+    0.618: 2.0,   # golden ratio — strongest
+    0.5:   1.5,   # 50% — very reliable
+    0.382: 1.5,   # common retracement
+    0.786: 1.3,   # deep retracement
+    0.236: 1.0,   # shallow
+    0.65:  1.0,
+    0.0:   0.8,
+    1.0:   0.8,
+}
+
+def find_swing_for_fib(kl, i, lookback=80):
+    """
+    Find the most recent significant swing high and low
+    for Fibonacci retracement calculation.
+    Returns (swing_high, swing_low, swing_high_idx, swing_low_idx)
+    """
+    if i < lookback: return None, None, None, None
+    window = kl[i-lookback:i+1]
+
+    swing_high = max(k['h'] for k in window)
+    swing_low  = min(k['l'] for k in window)
+    sh_idx = next((j for j,k in enumerate(window) if k['h']==swing_high), None)
+    sl_idx = next((j for j,k in enumerate(window) if k['l']==swing_low), None)
+
+    if swing_high <= swing_low: return None, None, None, None
+    return swing_high, swing_low, sh_idx, sl_idx
+
+def calc_fib_levels(swing_high, swing_low, trend='down'):
+    """
+    Calculate Fibonacci retracement levels.
+    trend='down': retracing DOWN from high to low (bearish move, fib from high)
+    trend='up':   retracing UP from low to high (bullish move, fib from low)
+    Returns dict of {price: fib_level}
+    """
+    if not swing_high or not swing_low: return {}
+    rng = swing_high - swing_low
+    if rng <= 0: return {}
+    levels = {}
+    for fib in FIB_LEVELS:
+        if trend == 'up':
+            # Retracement from bottom: 0=low, 1=high, 0.618=pullback to 61.8%
+            levels[round(swing_low + rng * fib, 2)] = fib
+        else:
+            # Retracement from top: 0=high, 1=low, 0.618=pullback to 38.2% from high
+            levels[round(swing_high - rng * fib, 2)] = fib
+    return levels
+
+def score_fib_confluence(price, fib_levels, pd_pw_pm_levels, atr, direction):
+    """
+    Score confluence between current price, Fibonacci levels, and PD/PW/PM levels.
+
+    Three scenarios:
+    1. Price at Fib level only → small boost
+    2. Price at PD/PW/PM level only → scored elsewhere
+    3. Price at BOTH Fib + PD/PW/PM → BIG boost (what you showed on chart)
+
+    Returns (score_boost, tags, best_fib_name)
+    """
+    if not fib_levels: return 0, [], None
+
+    tol = 0.6  # within 0.6 ATR = "at the level"
+    score = 0; tags = []; best_fib = None
+
+    for fib_price, fib_ratio in fib_levels.items():
+        if abs(price - fib_price) / atr > tol: continue
+
+        fib_w    = FIB_WEIGHTS.get(fib_ratio, 0.8)
+        fib_name = FIB_NAMES.get(fib_ratio, f'Fib{round(fib_ratio*100):.0f}')
+
+        # Fib level type
+        if fib_ratio in (0.0, 0.236, 0.382): fib_type = 'support_zone'
+        elif fib_ratio in (0.618, 0.65, 0.786, 1.0): fib_type = 'resistance_zone'
+        else: fib_type = 'neutral'  # 0.5
+
+        # Direction alignment
+        aligned = ((direction=='BUY'  and fib_type in ('support_zone','neutral')) or
+                   (direction=='SELL' and fib_type in ('resistance_zone','neutral')))
+
+        base_score = fib_w * (1.0 if aligned else -0.3)
+        score += base_score
+
+        # ── CHECK FOR PD/PW/PM CONFLUENCE AT SAME PRICE ──────────────
+        # This is the KEY feature you identified on the chart
+        if pd_pw_pm_levels:
+            for lvl_name, lvl_price in pd_pw_pm_levels.items():
+                if not lvl_price: continue
+                # Are the Fib level and PD/PW/PM level within 0.3 ATR?
+                if abs(fib_price - lvl_price) / atr < 0.4:
+                    tf_w = 1.6 if lvl_name.startswith('PM') else \
+                           1.3 if lvl_name.startswith('PW') else 1.0
+                    confluence_bonus = fib_w * tf_w * 0.8
+                    score += confluence_bonus
+                    tags.append(f'{fib_name}+{lvl_name}✓')
+                    if best_fib is None: best_fib = f'{fib_name}+{lvl_name}'
+                    break
+            else:
+                # No PD/PW/PM confluence — just plain fib
+                if aligned:
+                    tags.append(f'{fib_name}✓')
+                    if best_fib is None: best_fib = fib_name
+
+    score = round(min(score, 4.0), 1)
+    return score, tags[:3], best_fib
+
+
+def get_fib_context(kl, i, pd_pw_pm_levels, atr, direction):
+    """
+    Main function: auto-detect swing, calc fibs, score confluence.
+    Returns (score_boost, tags, fib_levels_dict, context_str)
+    """
+    sh, sl, sh_idx, sl_idx = find_swing_for_fib(kl, i)
+    if not sh or not sl: return 0, [], {}, None
+
+    # Determine trend for fib direction
+    # If swing high came AFTER swing low = uptrend = retracing down
+    # If swing low came AFTER swing high = downtrend = retracing up
+    trend = 'up' if (sh_idx is not None and sl_idx is not None
+                     and sh_idx > sl_idx) else 'down'
+
+    fib_levels = calc_fib_levels(sh, sl, trend)
+    boost, tags, best = score_fib_confluence(
+        kl[i]['c'], fib_levels, pd_pw_pm_levels, atr, direction)
+
+    ctx = f"Swing: {sl:.0f}–{sh:.0f} | Trend: {trend}" if sh else None
+    return boost, tags, fib_levels, ctx
+
+
 def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                ht_a, atr_a, va_a, weekly_b, daily_b):
     """
@@ -2076,6 +2229,9 @@ def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
             if abs(price - z['level']) / at < 1.0:
                 if (z['ltype']=='resistance' and direction=='SELL') or                    (z['ltype']=='support'    and direction=='BUY'):
                     b += z['strength'] * 0.5; t.append(f"{z['tf']}✓")
+        # Add Fibonacci confluence
+        fb, ft, _, _ = get_fib_context(kl, i, _all_lvls, at, direction)
+        b += fb; t.extend(ft)
         return b, t, n
 
     # ── HTF DIRECTION — applies to ALL setups ────────────────────────
