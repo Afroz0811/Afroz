@@ -2842,15 +2842,50 @@ def main():
                         elif txt == '/reset_weights':
                             db = load_db(); db['weights']=DEFAULT_WEIGHTS.copy(); save_db(db)
                             send_tg("✅ Weights reset to defaults")
+                        elif txt in ('/backup', '/save', '/download'):
+                            # Send all learning files to TG
+                            import os as _os
+                            files_sent = 0
+                            for fname, fpath in [
+                                ('smc_learning.json',      LEARN_FILE),
+                                ('smc_deep_learning.json', DEEP_LEARN_FILE),
+                                ('smc_journal.json',       JOURNAL_FILE),
+                            ]:
+                                if _os.path.exists(fpath) and _os.path.getsize(fpath) > 10:
+                                    try:
+                                        with open(fpath,'rb') as _f:
+                                            requests.post(
+                                                f'https://api.telegram.org/bot{TG_TOKEN}/sendDocument',
+                                                data={'chat_id':TG_CHAT,
+                                                      'caption':f'📦 {fname} ({_os.path.getsize(fpath):,} bytes)'},
+                                                files={'document':(_f.name.split("/")[-1], _f, 'application/json')},
+                                                timeout=30)
+                                        files_sent += 1
+                                    except Exception as _be:
+                                        log.debug(f"Backup {fname}: {_be}")
+                            send_tg(f"💾 Backup done — {files_sent} files sent" if files_sent
+                                    else "⚠️ No data files found yet (no trades completed)")
+                        elif txt == '/paths':
+                            send_tg(
+                                f"📂 <b>Data file paths</b>\n\n"
+                                f"LEARN: <code>{LEARN_FILE}</code> — "
+                                f"{'✅ exists' if __import__('os').path.exists(LEARN_FILE) else '❌ missing'}\n"
+                                f"DEEP:  <code>{DEEP_LEARN_FILE}</code> — "
+                                f"{'✅ exists' if __import__('os').path.exists(DEEP_LEARN_FILE) else '❌ missing'}\n"
+                                f"JOURNAL: <code>{JOURNAL_FILE}</code> — "
+                                f"{'✅ exists' if __import__('os').path.exists(JOURNAL_FILE) else '❌ missing'}\n"
+                            )
                         elif txt == '/help':
                             send_tg(
                                 "📡 <b>SMC Bot Commands</b>\n\n"
                                 "/stats   — performance report\n"
-                                "/learn   — learning weights report\n"
-                                "/deep    — deep chart analysis report\n"
+                                "/learn   — ML weights report\n"
                                 "/weights — learned weights\n"
-                                "/weekly  — weekly summary\n"
                                 "/open    — open trades\n"
+                                "/backup  — download all data files\n"
+                                "/paths   — check data file locations\n"
+                                "/regime  — market regime per coin\n"
+                                "/patterns — discovered patterns\n"
                                 "/help    — this menu"
                             )
             except Exception as e:
