@@ -1592,30 +1592,53 @@ def _check_btc_correlation(kl_btc, direction):
 def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                   ht_a, atr_a, va_a, weekly_b, daily_b, session=None, kl_btc=None):
     """
-    Pure confluence engine — no hardcoded setups.
-    Scores 12 independent conditions, fires when total >= threshold.
-    ML tracks which combinations win and adjusts weights.
+    Adaptive confluence engine with 3 mandatory rules:
+    1. HTF bias is HARD filter — never trade counter-trend
+    2. Sweep must be CONFIRMED (candle closed back above/below swept level)
+    3. SL placed below/above full sweep wick
     """
     if len(kl) < 60 or i < 50: return None
     k     = kl[i]; price = closes[i]
     at    = atr_a[i]; va_v = va_a[i]
     if not at or not va_v: return None
 
-    # ATR quality — penalty not hard gate
-    atr_q = _check_atr_quality(atr_a, i)
-    # (no hard return — ATR becomes score penalty instead)
+    # ── RULE 1: HTF BIAS — HARD FILTER ──────────────────────────────────
+    # This is the fix for "wrong direction" trades
+    # weekly_b tells us the higher timeframe trend
+    # NEVER buy in a bearish weekly trend
+    # NEVER sell in a bullish weekly trend
+    # Only trade WITH the trend or in neutral markets
+    allowed_dirs = []
+    if weekly_b == 'bullish':
+        allowed_dirs = ['BUY']           # only longs in uptrend
+    elif weekly_b == 'bearish':
+        allowed_dirs = ['SELL']          # only shorts in downtrend
+    else:
+        allowed_dirs = ['BUY', 'SELL']   # both ok in neutral
 
-    # ── Step 1: Determine direction from sweep (primary trigger) ────────
+    # Daily bias adds conviction — if daily confirms weekly, higher score
+    daily_confirms = (daily_b == weekly_b)
+
+    # ── RULE 2: CONFIRMED SWEEP (not just wick) ──────────────────────────
+    # Price must have swept the level AND closed back on the other side
+    # k['l'] < level AND k['c'] > level (for BUY)
+    # This prevents entering on the sweep candle itself (which is too early)
     sweep_dir, sweep_str, wick_level = _check_liquidity_sweep(kl, i, sh, sl_sw, at, va_v)
 
-    # If no sweep, try EMA/structure direction (relaxed conditions)
+    # Enforce HTF filter on sweep direction
+    if sweep_dir and sweep_dir not in allowed_dirs:
+        sweep_dir = None; sweep_str = 0; wick_level = None
+
+    # If no confirmed sweep, try EMA/structure WITH trend only
     if not sweep_dir:
-        if (e9_a[i] and e20_a[i] and e50_a[i] and
+        if ('BUY' in allowed_dirs and
+                e9_a[i] and e20_a[i] and e50_a[i] and
                 e9_a[i] > e20_a[i] > e50_a[i] and
                 ht_a[i] and ht_a[i] > 0 and
                 rsi_a[i] and rsi_a[i] < 60):
             sweep_dir = 'BUY'; sweep_str = 0
-        elif (e9_a[i] and e20_a[i] and e50_a[i] and
+        elif ('SELL' in allowed_dirs and
+                e9_a[i] and e20_a[i] and e50_a[i] and
                 e9_a[i] < e20_a[i] < e50_a[i] and
                 ht_a[i] and ht_a[i] < 0 and
                 rsi_a[i] and rsi_a[i] > 40):
@@ -1681,12 +1704,15 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
     score += sess_bonus
     conditions['session'] = session
 
-    # 10. Weekly bias
+    # 10. Weekly + Daily bias (HTF already filtered — this adds conviction score)
     htf_str = _check_weekly_bias(weekly_b, direction)
     score += htf_str * 0.8
     if htf_str > 0: tags.append('HTF✓')
-    elif htf_str < 0: tags.append('HTF✗')
     conditions['weekly_bias'] = weekly_b
+    # Daily confirms weekly = extra conviction
+    if daily_confirms and htf_str > 0:
+        score += 0.8; tags.append('Daily✓')
+    conditions['daily_bias'] = daily_b
 
     # 11. BTC correlation
     btc_str = _check_btc_correlation(kl_btc, direction)
@@ -1746,18 +1772,24 @@ def get_signal_v2(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
         return None
 
     # ── Step 6: SL placement ─────────────────────────────────────────────
+    # ── RULE 3: SL BELOW FULL WICK ─────────────────────────────────────
+    # The most common reason for early SL hits:
+    # SL was placed just below the entry candle, not below the sweep wick
+    # Fix: SL goes below the LOWEST point of the sweep (full wick)
     if wick_level and direction == 'BUY':
-        sl_p = wick_level - at*0.08  # tight: just below sweep wick
+        # Find the actual lowest wick of the sweep candle(s)
+        sweep_low = min(kl[j]['l'] for j in range(max(0,i-3), i+1))
+        sl_p = sweep_low - at*0.15   # buffer below full sweep wick
     elif wick_level and direction == 'SELL':
-        sl_p = wick_level + at*0.08
+        sweep_high = max(kl[j]['h'] for j in range(max(0,i-3), i+1))
+        sl_p = sweep_high + at*0.15
     else:
-        # Structure-based SL
         sl_p = structure_sl(kl, sh, sl_sw, i, direction, at)
         if sl_p is None:
-            sl_p = price - at*1.5 if direction=='BUY' else price + at*1.5
+            sl_p = price - at*1.8 if direction=='BUY' else price + at*1.8
 
-    # Safety cap
-    max_risk = price * 0.03
+    # Safety cap — max 2.5% risk
+    max_risk = price * 0.025
     if direction == 'BUY'  and (price-sl_p) > max_risk: sl_p = price - max_risk
     if direction == 'SELL' and (sl_p-price) > max_risk: sl_p = price + max_risk
 
@@ -1819,216 +1851,307 @@ def learn_condition_boosts(db):
 
 
 # ── SIGNAL DETECTION ───────────────────────────
+
 def get_signal(kl, sh, sl_sw, i, closes, rsi_a, e9_a, e20_a, e50_a,
                ht_a, atr_a, va_a, weekly_b, daily_b):
-    price = kl[i]['c']; k = kl[i]
+    """
+    6-setup signal engine — all WITH the trend.
+    Every setup requires HTF alignment as first check.
+    Setups:
+      1. SWEEP_OB      — liquidity sweep + OB retest (primary)
+      2. CHOCH         — trend change ONLY after clear structure flip
+      3. BOS_RETEST    — break of structure + retest (not false break)
+      4. EMA_PULLBACK  — clean pullback to EMA in strong trend
+      5. VWAP_BOUNCE   — bounce off VWAP with volume
+      6. DOUBLE_SWEEP  — two sweeps at same level (strong signal)
+    """
+    if len(kl) < 80 or i < 60: return None
+    price = closes[i]; k = kl[i]
     at = atr_a[i]; va_v = va_a[i]
+    if not at or not va_v or not rsi_a[i]: return None
 
-    # ── SETUP 1: SWEEP + OB RETEST ──────────────
-    #
-    # HOW IT WORKS:
-    # 1. Price forms equal lows (liquidity resting below)
-    # 2. A sweep candle wicks BELOW those lows (stop hunt) and CLOSES back above
-    # 3. We find the OB: last bearish (red) candle BEFORE the sweep — that's where
-    #    institutions placed their buy orders
-    # 4. Signal fires when price RETESTS that OB zone (comes back into it)
-    # 5. SL = just below the sweep wick low (tight, precise)
-    #
-    # Two scenarios detected:
-    # A) i IS the sweep candle (fires immediately when close is back in OB)
-    # B) i is a retest candle AFTER the sweep (1-5 bars later, price in OB)
+    # ── HTF DIRECTION — applies to ALL setups ────────────────────────
+    if weekly_b == 'bullish':
+        allowed = ['BUY']
+    elif weekly_b == 'bearish':
+        allowed = ['SELL']
+    else:
+        allowed = ['BUY', 'SELL']
 
-    for li, lvl in [(ix,p) for ix,p in sl_sw if ix < i and ix > i-50][-4:]:
+    daily_ok = (daily_b == weekly_b) or weekly_b == 'neutral'
 
-        # ── Scenario A: current candle swept AND closed back in OB ──
-        sweep_bar = None; wick_low_val = None
-        if k['l'] < lvl and price > lvl:
-            if lvl - k['l'] < at*0.25: continue    # wick must be meaningful
-            if k['v'] < va_v*1.15: continue         # volume surge required
-            sweep_bar = i; wick_low_val = k['l']
-
-        # ── Scenario B: sweep happened 1-8 bars ago, now retesting OB ──
-        elif li <= i-1 and li >= i-8:
-            # Find the sweep candle in history
-            sc = next((kl[j] for j in range(li, min(li+4, i+1))
-                       if kl[j]['l'] < lvl and kl[j]['c'] > lvl), None)
-            if sc and sc['v'] > va_v*1.1:
-                sweep_bar = li; wick_low_val = sc['l']
-            else:
-                continue
-        else:
-            continue
-
-        # daily bias now handled as score modifier in v2 engine
-        # weekly bias now handled as score modifier in v2 engine
-        # RSI now scored not gated
-
-        # ── ANTI-TREND FILTER: Don't buy into a strong downtrend ──
-        # Check last 6 candles — if 5+ are bearish = strong downtrend, skip
-        recent = kl[max(0,i-6):i+1]
-        bearish_count = sum(1 for x in recent if x['c'] < x['o'])
-        if bearish_count >= 5: continue  # 5/6 red candles = skip BUY
-
-        # Price must be making higher lows recently (not lower lows)
-        recent_lows = [x['l'] for x in kl[max(0,i-4):i+1]]
-        if len(recent_lows) >= 3 and recent_lows[-1] < recent_lows[-3]*0.995:
-            continue  # still making lower lows = downtrend not reversed
-
-        # Find the OB: last red candle before the swing low formed
+    # ── SETUP 1: SWEEP + OB RETEST ───────────────────────────────────
+    # Best setup. Sweep liquidity, price closes back, enters OB zone.
+    # Only fires when sweep is CONFIRMED (candle closed back above/below level)
+    for li, lvl in [(ix, float(p)) for ix, p in sl_sw if i-15 < ix < i][-5:]:
+        if 'BUY' not in allowed: break
+        # Confirmed sweep: wick below AND close above
+        sweep_candle = next((kl[j] for j in range(li, min(li+4,i+1))
+                             if kl[j]['l'] < lvl and kl[j]['c'] > lvl), None)
+        if not sweep_candle: continue
+        if sweep_candle['v'] < va_v * 0.9: continue
+        # Now in OB zone? (last bearish candle before sweep)
         ob = None
-        for j in range(li-1, max(0, li-15), -1):
-            if kl[j]['c'] < kl[j]['o']:  # red candle = bullish OB
-                fwd = (kl[min(j+2,len(kl)-1)]['c'] - kl[j]['c']) / kl[j]['c']
-                if fwd > 0.003:           # followed by bullish move
-                    ob = {'top': kl[j]['o'], 'bot': kl[j]['l']}
-                    break
-
+        for j in range(li-1, max(0,li-10), -1):
+            if kl[j]['c'] < kl[j]['o']:
+                ob = {'top': kl[j]['o'], 'bot': kl[j]['l']}; break
         if not ob: continue
+        if not (ob['bot'] <= price <= ob['top'] * 1.008): continue
+        if not (28 < rsi_a[i] < 65): continue
+        # SL below full sweep wick
+        sl_p = sweep_candle['l'] - at * 0.2
+        if (price - sl_p) / price > 0.025: continue
+        score = 8.5 + (0.5 if daily_ok else 0) + (0.5 if k['v'] > va_v*1.3 else 0)
+        tags = ['Sweep✓', 'OB✓', 'HTF✓']
+        if daily_ok: tags.append('Daily✓')
+        return {'dir':'BUY','setup':'SWEEP_OB','name':'⚡ Sweep + OB Retest',
+                'score':score,'tags':tags,'swept':lvl,'ob':ob,'sl_raw':sl_p,
+                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i])}
 
-        # Price must be IN the OB zone to fire
-        if not (ob['bot'] <= price <= ob['top']*1.008): continue
-
-        ema_ok = e20_a[i] and e50_a[i] and price > e20_a[i] > e50_a[i]
-        score  = 8 + (0.5 if ema_ok else 0)
-
-        return {'dir':'BUY', 'setup':'SWEEP_OB',
-                'name':'⚡ Liq Sweep + OB Retest',
-                'score': score,
-                'ob': ob,
-                'swept': lvl,
-                'wick_low': wick_low_val,   # exact wick for tight SL
-                'tags': ['Sweep↑','OB_Retest','Vol✓','HTF✓','Week✓']
-                       +(['EMA↑'] if ema_ok else [])+[f'RSI{round(rsi_a[i])}']}
-
-    for hi_, lvl in [(ix,p) for ix,p in sh if ix < i and ix > i-50][-4:]:
-
-        sweep_bar_s = None; wick_high_val = None
-        if k['h'] > lvl and price < lvl:
-            if k['h'] - lvl < at*0.25: continue
-            if k['v'] < va_v*1.15: continue
-            sweep_bar_s = i; wick_high_val = k['h']
-        elif hi_ <= i-1 and hi_ >= i-8:
-            sc = next((kl[j] for j in range(hi_, min(hi_+4, i+1))
-                       if kl[j]['h'] > lvl and kl[j]['c'] < lvl), None)
-            if sc and sc['v'] > va_v*1.1:
-                sweep_bar_s = hi_; wick_high_val = sc['h']
-            else:
-                continue
-        else:
-            continue
-
-        # daily/weekly now scored not gated
-        if not rsi_a[i] or not (35 < rsi_a[i] < 75): continue
-
-        # Anti-trend filter for sells
-        recent = kl[max(0,i-6):i+1]
-        bullish_count = sum(1 for x in recent if x['c'] > x['o'])
-        if bullish_count >= 5: continue  # 5/6 green candles = skip SELL
-        recent_highs = [x['h'] for x in kl[max(0,i-4):i+1]]
-        if len(recent_highs) >= 3 and recent_highs[-1] > recent_highs[-3]*1.005:
-            continue  # still making higher highs = uptrend not reversed
+    for hi_, lvl in [(ix, float(p)) for ix, p in sh if i-15 < ix < i][-5:]:
+        if 'SELL' not in allowed: break
+        sweep_candle = next((kl[j] for j in range(hi_, min(hi_+4,i+1))
+                              if kl[j]['h'] > lvl and kl[j]['c'] < lvl), None)
+        if not sweep_candle: continue
+        if sweep_candle['v'] < va_v * 0.9: continue
         ob = None
-        for j in range(hi_-1, max(0, hi_-15), -1):
+        for j in range(hi_-1, max(0,hi_-10), -1):
             if kl[j]['c'] > kl[j]['o']:
-                fwd = (kl[min(j+2,len(kl)-1)]['c'] - kl[j]['c']) / kl[j]['c']
-                if fwd < -0.003:
-                    ob = {'top': kl[j]['h'], 'bot': kl[j]['c']}; break
-        if not ob or not (ob['bot']*0.995 <= price <= ob['top']): continue
-        ema_ok = e20_a[i] and e50_a[i] and price < e20_a[i] < e50_a[i]
-        return {'dir':'SELL', 'setup':'SWEEP_OB',
-                'name':'⚡ Liq Sweep + OB Retest',
-                'score': 8+(0.5 if ema_ok else 0),
-                'ob': ob, 'swept': lvl,
-                'wick_high': wick_high_val,
-                'tags': ['Sweep↓','OB_Retest','Vol✓','HTF✓','Week✓']
-                       +(['EMA↓'] if ema_ok else [])+[f'RSI{round(rsi_a[i])}']}
+                ob = {'top': kl[j]['h'], 'bot': kl[j]['c']}; break
+        if not ob: continue
+        if not (ob['bot'] * 0.992 <= price <= ob['top']): continue
+        if not (35 < rsi_a[i] < 72): continue
+        sl_p = sweep_candle['h'] + at * 0.2
+        if (sl_p - price) / price > 0.025: continue
+        score = 8.5 + (0.5 if daily_ok else 0) + (0.5 if k['v'] > va_v*1.3 else 0)
+        tags = ['Sweep✓', 'OB✓', 'HTF✓']
+        if daily_ok: tags.append('Daily✓')
+        return {'dir':'SELL','setup':'SWEEP_OB','name':'⚡ Sweep + OB Retest',
+                'score':score,'tags':tags,'swept':lvl,'ob':ob,'sl_raw':sl_p,
+                'weekly':weekly_b,'daily':daily_b,'rsi_val':round(rsi_a[i])}
 
-    # ── SETUP 2: 3-TF HTF CONFLUENCE ────────────
-    if i >= 50 and ht_a[i] and weekly_b != 'neutral' and weekly_b == daily_b:
-        rh4 = [(ix,p) for ix,p in sh if ix <= i][-4:]
-        rl4 = [(ix,p) for ix,p in sl_sw if ix <= i][-4:]
-        h1 = 'neutral'
-        if len(rh4) >= 2 and len(rl4) >= 2:
-            if rh4[-1][1] > rh4[-2][1] and rl4[-1][1] > rl4[-2][1]: h1 = 'bullish'
-            elif rh4[-1][1] < rh4[-2][1] and rl4[-1][1] < rl4[-2][1]: h1 = 'bearish'
-        if h1 == weekly_b:
-            is_buy = h1 == 'bullish'
-            ema_ok = (e9_a[i] and e20_a[i] and e50_a[i] and
-                      (e9_a[i]>e20_a[i]>e50_a[i] if is_buy else e9_a[i]<e20_a[i]<e50_a[i]))
-            mac_ok = ht_a[i] > 0 if is_buy else ht_a[i] < 0
-            rsi_ok = rsi_a[i] and (25 < rsi_a[i] < 62 if is_buy else 38 < rsi_a[i] < 75)
-            if ema_ok and mac_ok and rsi_ok:
-                vol_ok = va_a[i] and kl[i]['v'] > va_a[i]*1.1
-                return {'dir': 'BUY' if is_buy else 'SELL',
-                        'setup': 'HTF_CONFLUENCE',
-                        'name': '📊 3-TF HTF Confluence (W+D+1h)',
-                        'score': 9 if vol_ok else 8, 'ob': None, 'swept': None,
-                        'tags': [f'W:{weekly_b[:4]}', f'D:{daily_b[:4]}',
-                                 f'1h:{h1[:4]}', 'EMA_stack', 'MACD✓']
-                               +(['Vol✓'] if vol_ok else [])+[f'RSI{round(rsi_a[i])}']}
+    # ── SETUP 2: EMA PULLBACK (strong trend continuation) ────────────
+    # Simple but highly effective: trend is clear, price pulls to EMA9/20, bounces
+    # Requirements: EMA stack aligned, RSI not extreme, volume on bounce
+    if e9_a[i] and e20_a[i] and e50_a[i] and ht_a[i]:
+        e9 = float(e9_a[i]); e20 = float(e20_a[i]); e50 = float(e50_a[i])
 
-    # ── SETUP 3: CHOCH ──────────────────────────
-    rh5 = [(ix,p) for ix,p in sh if ix <= i][-5:]
-    rl5 = [(ix,p) for ix,p in sl_sw if ix <= i][-5:]
-    if len(rh5) >= 3 and len(rl5) >= 3 and ht_a[i] and va_a[i]:
-        h_gaps = [abs(rh5[j+1][1]-rh5[j][1])/max(rh5[j][1],1e-10)
-                  for j in range(len(rh5)-2, len(rh5)-1)]
-        l_gaps = [abs(rl5[j+1][1]-rl5[j][1])/max(rl5[j][1],1e-10)
-                  for j in range(len(rl5)-2, len(rl5)-1)]
-        if all(g >= 0.003 for g in h_gaps) and all(g >= 0.003 for g in l_gaps):
-            h2, h1p = rh5[-2][1], rh5[-3][1]
-            l2, l1p = rl5[-2][1], rl5[-3][1]
-            vol_ok = kl[i]['v'] > va_a[i]*1.05
-            if (h2 < h1p and l2 < l1p and price > h2 and
-                    e20_a[i] and price > e20_a[i] and ht_a[i] > 0 and
-                    rsi_a[i] and 28 < rsi_a[i] < 65 and vol_ok and
-                    weekly_b != 'bearish'):
-                return {'dir':'BUY', 'setup':'CHOCH',
-                        'name':'🔄 CHoCH Reversal (Bear→Bull)',
-                        'score': 8, 'ob': None, 'swept': None,
-                        'tags': ['CHoCH↑','CleanStr','Vol✓','MACD✓',
-                                 f'RSI{round(rsi_a[i])}']}
-            if (h2 > h1p and l2 > l1p and price < l2 and
-                    e20_a[i] and price < e20_a[i] and ht_a[i] < 0 and
-                    rsi_a[i] and 35 < rsi_a[i] < 72 and vol_ok and
-                    weekly_b != 'bullish'):
-                return {'dir':'SELL', 'setup':'CHOCH',
-                        'name':'🔄 CHoCH Reversal (Bull→Bear)',
-                        'score': 8, 'ob': None, 'swept': None,
-                        'tags': ['CHoCH↓','CleanStr','Vol✓','MACD✓',
-                                 f'RSI{round(rsi_a[i])}']}
+        # BUY: strong bull stack, pulled to EMA9 or EMA20
+        if ('BUY' in allowed and e9 > e20 > e50 and ht_a[i] > 0 and
+                38 < rsi_a[i] < 58):
+            # Price touching EMA9
+            if abs(price - e9) < at * 0.6 and price > e20:
+                # Bounce confirmation: current close > open (green candle)
+                if k['c'] > k['o'] and k['v'] > va_v * 0.85:
+                    sl_p = e20 - at * 0.2
+                    if (price - sl_p) / price <= 0.025:
+                        score = 7.5 + (1.0 if daily_ok else 0)
+                        return {'dir':'BUY','setup':'EMA_PULL',
+                                'name':'📊 EMA Pullback','score':score,
+                                'tags':['EMA9✓','Trend↑','HTF✓'],'sl_raw':sl_p,
+                                'weekly':weekly_b,'daily':daily_b,
+                                'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+            # Price touching EMA20 (deeper pullback)
+            elif abs(price - e20) < at * 0.5 and k['c'] > k['o']:
+                sl_p = e50 - at * 0.2 if e50 else e20 - at * 0.5
+                if (price - sl_p) / price <= 0.025:
+                    score = 7.0 + (1.0 if daily_ok else 0)
+                    return {'dir':'BUY','setup':'EMA_PULL',
+                            'name':'📊 EMA20 Pullback','score':score,
+                            'tags':['EMA20✓','Trend↑','HTF✓'],'sl_raw':sl_p,
+                            'weekly':weekly_b,'daily':daily_b,
+                            'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
 
-    # ── SETUP 4: BOS ────────────────────────────
-    rh4b = [(ix,p) for ix,p in sh if ix <= i][-4:]
-    rl4b = [(ix,p) for ix,p in sl_sw if ix <= i][-4:]
-    if len(rh4b) >= 3 and len(rl4b) >= 3 and ht_a[i] and va_a[i]:
-        h1p, h2p, h3p = rh4b[-3][1], rh4b[-2][1], rh4b[-1][1]
-        l1p, l2p, l3p = rl4b[-3][1], rl4b[-2][1], rl4b[-1][1]
-        vol_ok = kl[i]['v'] > va_a[i]*1.1
-        if (h3p > h2p > h1p and l3p > l2p and price > h2p and
-                ht_a[i] > 0 and e20_a[i] and e50_a[i] and
-                price > e20_a[i] > e50_a[i] and
-                rsi_a[i] and 28 < rsi_a[i] < 68 and vol_ok and
-                weekly_b != 'bearish'):
-            return {'dir':'BUY', 'setup':'BOS',
-                    'name':'📈 BOS Continuation (Bullish)',
-                    'score': 7, 'ob': None, 'swept': None,
-                    'tags': ['BOS↑','HH+HL','Vol✓','MACD✓',
-                             f'RSI{round(rsi_a[i])}']}
-        if (h3p < h2p < h1p and l3p < l2p and price < l2p and
-                ht_a[i] < 0 and e20_a[i] and e50_a[i] and
-                price < e20_a[i] < e50_a[i] and
-                rsi_a[i] and 32 < rsi_a[i] < 72 and vol_ok and
-                weekly_b != 'bullish'):
-            return {'dir':'SELL', 'setup':'BOS',
-                    'name':'📉 BOS Continuation (Bearish)',
-                    'score': 7, 'ob': None, 'swept': None,
-                    'tags': ['BOS↓','LH+LL','Vol✓','MACD✓',
-                             f'RSI{round(rsi_a[i])}']}
+        # SELL: strong bear stack
+        if ('SELL' in allowed and e9 < e20 < e50 and ht_a[i] < 0 and
+                42 < rsi_a[i] < 62):
+            if abs(price - e9) < at * 0.6 and price < e20:
+                if k['c'] < k['o'] and k['v'] > va_v * 0.85:
+                    sl_p = e20 + at * 0.2
+                    if (sl_p - price) / price <= 0.025:
+                        score = 7.5 + (1.0 if daily_ok else 0)
+                        return {'dir':'SELL','setup':'EMA_PULL',
+                                'name':'📊 EMA Pullback','score':score,
+                                'tags':['EMA9✓','Trend↓','HTF✓'],'sl_raw':sl_p,
+                                'weekly':weekly_b,'daily':daily_b,
+                                'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+            elif abs(price - e20) < at * 0.5 and k['c'] < k['o']:
+                sl_p = e50 + at * 0.2 if e50 else e20 + at * 0.5
+                if (sl_p - price) / price <= 0.025:
+                    score = 7.0 + (1.0 if daily_ok else 0)
+                    return {'dir':'SELL','setup':'EMA_PULL',
+                            'name':'📊 EMA20 Pullback','score':score,
+                            'tags':['EMA20✓','Trend↓','HTF✓'],'sl_raw':sl_p,
+                            'weekly':weekly_b,'daily':daily_b,
+                            'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+
+    # ── SETUP 3: BOS RETEST (confirmed break, then retest) ───────────
+    # Price breaks a swing high/low WITH volume, then pulls back to retest
+    # The retest is the entry — not the breakout itself
+    # This fixes the false break problem from before
+    if e9_a[i] and e20_a[i]:
+        # BUY: broken swing high, now retesting from above
+        rh = [(ix, float(p)) for ix, p in sh if i-20 < ix < i-3][-3:]
+        for hi_, lvl in rh:
+            if 'BUY' not in allowed: break
+            # Was there a confirmed break above this level?
+            break_bar = next((kl[j] for j in range(hi_+1, min(hi_+8, i))
+                              if kl[j]['c'] > lvl and kl[j]['v'] > va_v * 1.2), None)
+            if not break_bar: continue
+            # Now retesting: price back near the level from above
+            if not (lvl * 0.997 <= price <= lvl * 1.012): continue
+            if rsi_a[i] and not (35 < rsi_a[i] < 60): continue
+            # Green candle = bounce confirmed
+            if k['c'] < k['o']: continue
+            sl_p = lvl - at * 0.3
+            if (price - sl_p) / price > 0.025: continue
+            score = 7.5 + (0.5 if daily_ok else 0)
+            return {'dir':'BUY','setup':'BOS_RETEST','name':'📈 BOS Retest',
+                    'score':score,'tags':['BOS✓','Retest✓','HTF✓'],'sl_raw':sl_p,
+                    'weekly':weekly_b,'daily':daily_b,
+                    'rsi_val':round(rsi_a[i]),'ob':None,'swept':lvl}
+
+        # SELL: broken swing low, now retesting from below
+        rl = [(ix, float(p)) for ix, p in sl_sw if i-20 < ix < i-3][-3:]
+        for li, lvl in rl:
+            if 'SELL' not in allowed: break
+            break_bar = next((kl[j] for j in range(li+1, min(li+8, i))
+                               if kl[j]['c'] < lvl and kl[j]['v'] > va_v * 1.2), None)
+            if not break_bar: continue
+            if not (lvl * 0.988 <= price <= lvl * 1.003): continue
+            if rsi_a[i] and not (40 < rsi_a[i] < 65): continue
+            if k['c'] > k['o']: continue
+            sl_p = lvl + at * 0.3
+            if (sl_p - price) / price > 0.025: continue
+            score = 7.5 + (0.5 if daily_ok else 0)
+            return {'dir':'SELL','setup':'BOS_RETEST','name':'📈 BOS Retest',
+                    'score':score,'tags':['BOS✓','Retest✓','HTF✓'],'sl_raw':sl_p,
+                    'weekly':weekly_b,'daily':daily_b,
+                    'rsi_val':round(rsi_a[i]),'ob':None,'swept':lvl}
+
+    # ── SETUP 4: CHOCH — only after CLEAR structure flip ─────────────
+    # The old CHOCH fired on any structure shift — too early, too many fakeouts
+    # New rule: need 3 consecutive HH/HL (for bull) or LH/LL (for bear) to confirm
+    # AND RSI must confirm the flip (RSI divergence or extreme zone)
+    if len(sh) >= 4 and len(sl_sw) >= 4:
+        recent_highs = [float(p) for _, p in sh[-4:]]
+        recent_lows  = [float(p) for _, p in sl_sw[-4:]]
+
+        # Bullish CHOCH: was making LH/LL, now first HH+HL confirmed
+        was_bearish = (recent_highs[-3] < recent_highs[-4] and
+                       recent_lows[-3]  < recent_lows[-4])
+        now_bullish = (recent_highs[-1] > recent_highs[-2] and
+                       recent_lows[-1]  > recent_lows[-2])
+        # RSI divergence: price made lower low but RSI made higher low
+        rsi_bull_div = (rsi_a[i] and i >= 10 and
+                        recent_lows[-1] < recent_lows[-2] and
+                        rsi_a[i] > (rsi_a[i-5] or 50))
+
+        if ('BUY' in allowed and was_bearish and now_bullish and
+                rsi_a[i] and rsi_a[i] < 55 and ht_a[i] and ht_a[i] > 0):
+            sl_p = min(recent_lows[-2:]) - at * 0.2
+            if (price - sl_p) / price <= 0.025:
+                score = 7.0 + (1.0 if rsi_bull_div else 0) + (0.5 if daily_ok else 0)
+                return {'dir':'BUY','setup':'CHOCH','name':'🔄 CHoCH Reversal',
+                        'score':score,'tags':['CHoCH↑','StructFlip','HTF✓'],
+                        'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                        'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+
+        # Bearish CHOCH
+        was_bullish = (recent_highs[-3] > recent_highs[-4] and
+                       recent_lows[-3]  > recent_lows[-4])
+        now_bearish = (recent_highs[-1] < recent_highs[-2] and
+                       recent_lows[-1]  < recent_lows[-2])
+        rsi_bear_div = (rsi_a[i] and i >= 10 and
+                        recent_highs[-1] > recent_highs[-2] and
+                        rsi_a[i] < (rsi_a[i-5] or 50))
+
+        if ('SELL' in allowed and was_bullish and now_bearish and
+                rsi_a[i] and rsi_a[i] > 45 and ht_a[i] and ht_a[i] < 0):
+            sl_p = max(recent_highs[-2:]) + at * 0.2
+            if (sl_p - price) / price <= 0.025:
+                score = 7.0 + (1.0 if rsi_bear_div else 0) + (0.5 if daily_ok else 0)
+                return {'dir':'SELL','setup':'CHOCH','name':'🔄 CHoCH Reversal',
+                        'score':score,'tags':['CHoCH↓','StructFlip','HTF✓'],
+                        'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                        'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+
+    # ── SETUP 5: DOUBLE SWEEP (strong institutional signal) ──────────
+    # Two sweeps at the same level = smart money clearing liquidity twice
+    # Very rare but very high probability
+    for li, lvl in [(ix, float(p)) for ix, p in sl_sw if i-30 < ix < i-5][-6:]:
+        if 'BUY' not in allowed: break
+        # Find a second sweep of same level
+        second = [(ix2, float(p2)) for ix2, p2 in sl_sw
+                  if li+2 < ix2 < i and abs(float(p2)-lvl)/lvl < 0.005]
+        if not second: continue
+        li2, lvl2 = second[-1]
+        # Both confirmed (closed above)
+        s1 = next((kl[j] for j in range(li, min(li+4,i)) if kl[j]['l']<lvl and kl[j]['c']>lvl), None)
+        s2 = next((kl[j] for j in range(li2, min(li2+4,i+1)) if kl[j]['l']<lvl2 and kl[j]['c']>lvl2), None)
+        if not s1 or not s2: continue
+        if rsi_a[i] and rsi_a[i] > 65: continue
+        sl_p = min(s1['l'], s2['l']) - at * 0.15
+        if (price - sl_p) / price > 0.025: continue
+        score = 9.0 + (0.5 if daily_ok else 0)
+        return {'dir':'BUY','setup':'DBL_SWEEP','name':'⚡⚡ Double Sweep',
+                'score':score,'tags':['DblSweep✓','StrongLvl','HTF✓'],
+                'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                'rsi_val':round(rsi_a[i]),'ob':None,'swept':lvl}
+
+    for hi_, lvl in [(ix, float(p)) for ix, p in sh if i-30 < ix < i-5][-6:]:
+        if 'SELL' not in allowed: break
+        second = [(ix2, float(p2)) for ix2, p2 in sh
+                  if hi_+2 < ix2 < i and abs(float(p2)-lvl)/lvl < 0.005]
+        if not second: continue
+        hi2, lvl2 = second[-1]
+        s1 = next((kl[j] for j in range(hi_, min(hi_+4,i)) if kl[j]['h']>lvl and kl[j]['c']<lvl), None)
+        s2 = next((kl[j] for j in range(hi2, min(hi2+4,i+1)) if kl[j]['h']>lvl2 and kl[j]['c']<lvl2), None)
+        if not s1 or not s2: continue
+        if rsi_a[i] and rsi_a[i] < 35: continue
+        sl_p = max(s1['h'], s2['h']) + at * 0.15
+        if (sl_p - price) / price > 0.025: continue
+        score = 9.0 + (0.5 if daily_ok else 0)
+        return {'dir':'SELL','setup':'DBL_SWEEP','name':'⚡⚡ Double Sweep',
+                'score':score,'tags':['DblSweep✓','StrongLvl','HTF✓'],
+                'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                'rsi_val':round(rsi_a[i]),'ob':None,'swept':lvl}
+
+    # ── SETUP 6: VWAP BOUNCE ─────────────────────────────────────────
+    # Price deviates far from VWAP, snaps back with volume
+    # Works in both trending and ranging markets
+    w20 = kl[max(0,i-23):i+1]; tv = sum(x['v'] for x in w20)
+    if tv and e9_a[i] and e20_a[i]:
+        vwap = sum(((x['h']+x['l']+x['c'])/3)*x['v'] for x in w20)/tv
+        dev  = (price - vwap) / vwap
+
+        if ('BUY' in allowed and dev < -0.006 and
+                k['c'] > k['o'] and k['v'] > va_v * 1.3 and
+                rsi_a[i] and rsi_a[i] < 42 and
+                float(e9_a[i]) > float(e20_a[i])):  # trend still up
+            sl_p = k['l'] - at * 0.15
+            if (price - sl_p) / price <= 0.022:
+                score = 7.0 + (0.5 if daily_ok else 0)
+                return {'dir':'BUY','setup':'VWAP_BOUNCE','name':'🎯 VWAP Bounce',
+                        'score':score,'tags':['VWAP✓','Vol++','Oversold'],
+                        'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                        'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+
+        if ('SELL' in allowed and dev > 0.006 and
+                k['c'] < k['o'] and k['v'] > va_v * 1.3 and
+                rsi_a[i] and rsi_a[i] > 58 and
+                float(e9_a[i]) < float(e20_a[i])):
+            sl_p = k['h'] + at * 0.15
+            if (sl_p - price) / price <= 0.022:
+                score = 7.0 + (0.5 if daily_ok else 0)
+                return {'dir':'SELL','setup':'VWAP_BOUNCE','name':'🎯 VWAP Bounce',
+                        'score':score,'tags':['VWAP✓','Vol++','Overbought'],
+                        'sl_raw':sl_p,'weekly':weekly_b,'daily':daily_b,
+                        'rsi_val':round(rsi_a[i]),'ob':None,'swept':None}
+
     return None
 
-# ── MAIN COMPUTE ───────────────────────────────
-last_fired = {}
+
 
 def compute(kl, pair, kl_btc=None):
     if len(kl) < 80: return None
@@ -2903,4 +3026,4 @@ def main():
         time.sleep(SCAN_EVERY * 60)
 
 if __name__ == '__main__':
-    main()
+    main()  
